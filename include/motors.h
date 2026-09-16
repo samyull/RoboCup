@@ -8,11 +8,13 @@
 // SET THIS TO REAL VALUES
 #define LEFT_MOTOR_ADDRESS 1     //Pin corresponding to the left dc motor
 #define RIGHT_MOTOR_ADDRESS 0    //Pin corresponding to the right dc motor
-#define MIN_SPEED_CAP 1           //Set the minimum speed value that can be written to the motors
-#define MAX_SPEED_CAP 1           //Set the maximum speed value that can be written to the motors
 
-void check_speed_limits(/*parameters*/);
-void set_motor(/*parameters*/);
+#define MOTOR_US_MIN 1050 // Max speed reverse
+#define MOTOR_US_MAX 1950 // Max speed forward
+#define MOTOR_US_STOP 1500 // Stop speed
+
 void motors_init();
+void set_motors(int left_speed, int right_speed);
+void stop_motors();
 
 #endif /* MOTORS_H_*/

@@ -11,14 +11,14 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
-#include <PMW3901.h>
+// #include <PMW3901.h>
 
 // ---- BNO055 (heading) ----
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 
 // ---- PMW3901 (xy) ----
-#define FLOW_CS_PIN 10   // TODO: set to whatever Teensy pin your PMW3901 CS is wired to
-PMW3901 flow(FLOW_CS_PIN);
+// #define FLOW_CS_PIN 10   // TODO: set to whatever Teensy pin your PMW3901 CS is wired to
+// PMW3901 flow(FLOW_CS_PIN);
 
 // TODO: calibrate this. Converts raw sensor counts -> mm of real-world displacement.
 // The PMW3901's count-to-distance ratio depends on the sensor's fixed mounting
@@ -35,11 +35,11 @@ void sensors_init() {
     Serial.println("BNO055 initialised");
   }
 
-  if (!flow.begin()) {
-    Serial.println("ERROR: PMW3901 not detected");
-  } else {
-    Serial.println("PMW3901 initialised");
-  }
+  // if (!flow.begin()) {
+  //   Serial.println("ERROR: PMW3901 not detected");
+  // } else {
+  //   Serial.println("PMW3901 initialised");
+  // }
 }
 
 float getHeading() {
@@ -50,7 +50,7 @@ float getHeading() {
 
 void read_opticalFlow(float &dy, float &dx) {
   int16_t deltaX = 0, deltaY = 0;
-  flow.readMotionCount(&deltaX, &deltaY);
+  // flow.readMotionCount(&deltaX, &deltaY);
 
   dx = deltaX * FLOW_SCALE;
   dy = deltaY * FLOW_SCALE;
