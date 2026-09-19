@@ -3,12 +3,12 @@
 
 float ARRIVAL_RADIUS_M = 0.05f; // 5cm
 
-static const int MAX_FORWARD_PCT = 70;
+static const int MAX_FORWARD_PCT = 90;
 static const int MAX_TURN_PCT = 60;
 static const float TURN_KP = 90.0f; // proportional gain for turning, in % per radian of heading error
 static const float FORWARD_CUTOFF_RAD = radians(60.0f);
 static const float SLOWDOWN_RADIUS_M = 0.30f;
-static const int MIN_APPROACH_PCT = 20;
+static const int MIN_APPROACH_PCT = 60;
 
 static float wrap_angle(float angle_rad) {
     while (angle_rad > PI) angle_rad -= 2.0f * PI;
@@ -60,4 +60,9 @@ void navigate_to_target(const Pose &pose, const Target &target, int &out_left_pc
             }
         }
     }
+
+    out_left_pct = clamp_pct(forward_pct - turn_pct);
+    out_right_pct = clamp_pct(forward_pct + turn_pct);
+
+
 }
