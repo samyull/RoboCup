@@ -2,6 +2,7 @@
 #include "motors.h"
 #include "pose.h"
 #include "navigation.h"
+#include "grid_map.h"
 
 // TODO: change to whatever pin the PMW3901's CS line is actually wired to
 static const uint8_t FLOW_CHIP_SELECT = 10;
@@ -50,6 +51,8 @@ void setup() {
   motors_init();
   Serial.println("motors_init() done");
 
+  map_init();
+
   if (!MOTOR_TEST_MODE) {
     pose_init(FLOW_CHIP_SELECT);
     Serial.print("pose_init() done - imu_ready=");
@@ -68,7 +71,14 @@ void loop() {
   }
 
   Pose pose = pose_update();
-  pose_print_debug();
+  map_update(pose);
+
+  // Debug print is slow (extra I2C reads) - throttle it to 5 Hz
+  static uint32_t last_debug_ms = 0;
+  if (millis() - last_debug_ms >= 200) {
+    last_debug_ms = millis();
+    pose_print_debug();
+  }
 
   if (!arrived && has_arrived(pose, test_target)) {
     arrived = true;
@@ -80,8 +90,8 @@ void loop() {
     int left_pct, right_pct;
     navigate_to_target(pose, test_target, left_pct, right_pct);
 
-    float err = heading_error_to(pose, test_target);
-    float dist = distance_to(pose, test_target);
+    // float err = heading_error_to(pose, test_target);
+    // float dist = distance_to(pose, test_target);
     // Serial.print("[nav] err_deg="); Serial.print(degrees(err), 1);
     // Serial.print(" dist="); Serial.print(dist, 3);
     // Serial.print(" L="); Serial.print(left_pct);

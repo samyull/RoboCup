@@ -4,15 +4,38 @@
 #include <Adafruit_BNO055.h>
 #include <Bitcraze_PMW3901.h>
 
-// See pose.h - CALIBRATE THIS for your actual mounting height.
+// ---------------------------------------------------------------------------
+// Flow sensor calibration / mounting
+// ---------------------------------------------------------------------------
+
+// Lens-to-floor height in metres. See pose.h - CALIBRATE FLOW_METERS_PER_COUNT
+// with a known-distance push test once this is set.
 float MOUNTING_HEIGHT = 0.08F;
-float FLOW_METERS_PER_COUNT = MOUNTING_HEIGHT * 0.0021f;
+float FLOW_METERS_PER_COUNT = MOUNTING_HEIGHT * 0.0021f;   // ~0.168 mm/count at 80 mm
+
+// Map the sensor's raw dx/dy onto the robot body frame (x = forward, y = left).
+// Push the robot forward, then to the left, and watch raw_dx / raw_dy in the
+// debug print. Set these so pushing forward makes x increase and pushing
+// left makes y increase.
+static const bool  FLOW_SWAP_XY   = false;  // true if the sensor's dy is the forward axis
+static const float FLOW_SIGN_FWD  = 1.0f;   // flip to -1 if forward push gives negative x
+static const float FLOW_SIGN_LEFT = 1.0f;   // flip to -1 if left push gives negative y
+
+// Flow sensor position relative to the robot's centre of rotation, in metres
+// (forward, left). Leave at 0 if it sits over the centre. If it doesn't,
+// spinning the robot makes it report fake translation, which is removed below.
+static const float FLOW_OFFSET_FWD_M  = 0.0f;
+static const float FLOW_OFFSET_LEFT_M = 0.0f;
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
 static Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 static Bitcraze_PMW3901 *flow_sensor = nullptr;
 
 static Pose current_pose;
-static float theta_offset = 0.0f; // heading at pose_init/reset, subtracted out
+static float theta_offset = 0.0f; // counter-clockwise IMU heading at pose_reset(), subtracted out
 static bool imu_ready = false;
 static bool flow_ready = false;
 
@@ -28,6 +51,10 @@ static float wrap_angle(float angle_rad) {
   while (angle_rad < -PI) angle_rad += 2.0f * PI;
   return angle_rad;
 }
+
+// ---------------------------------------------------------------------------
+// Init / reset (init sequence unchanged from the version that worked)
+// ---------------------------------------------------------------------------
 
 void pose_init(uint8_t flow_chip_select) {
   Wire.begin();
@@ -61,8 +88,7 @@ void pose_init(uint8_t flow_chip_select) {
   }
 
   if (imu_ready) {
-    // NDOF sensor fusion takes a moment to spin up after the mode switch
-    // inside setExtCrystalUse() - give it time before trusting status/output.
+    // Give fusion a moment before trusting status/output.
     delay(1000);
     uint8_t system_status, self_test_result, system_error;
     bno.getSystemStatus(&system_status, &self_test_result, &system_error);
@@ -81,36 +107,72 @@ void pose_reset() {
 
   if (imu_ready) {
     sensors_event_t orientation;
-    bno.getEvent(&orientation, Adafruit_BNO055::VECTOR_EULER);
-    // BNO055 Euler heading is degrees, clockwise-positive, 0-360.
-    // Convert to radians, counter-clockwise-positive, then store as the
-    // offset so that current heading reads as theta = 0 right now.
-    theta_offset = wrap_angle(-radians(orientation.orientation.x));
+    if (bno.getEvent(&orientation, Adafruit_BNO055::VECTOR_EULER)) {
+      // BNO055 Euler heading is degrees, clockwise-positive, 0-360.
+      // Convert to radians, counter-clockwise-positive, and remember it so
+      // that the current heading reads as theta = 0 right now.
+      theta_offset = wrap_angle(-radians(orientation.orientation.x));
+    }
+  }
+
+  if (flow_ready) {
+    // Throw away counts accumulated before this point (e.g. during init).
+    int16_t dx, dy;
+    flow_sensor->readMotionCount(&dx, &dy);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Localisation
+// ---------------------------------------------------------------------------
+
 Pose pose_update() {
+  float d_theta = 0.0f;                 // heading change this step (rad, CCW+)
+  float theta_mid = current_pose.theta; // heading half-way through the step
+
   // --- Heading from BNO055 ---
   if (imu_ready) {
     sensors_event_t orientation;
     last_euler_read_ok = bno.getEvent(&orientation, Adafruit_BNO055::VECTOR_EULER);
-    last_heading_deg_raw = orientation.orientation.x;
-    float heading_ccw = -radians(last_heading_deg_raw);
-    current_pose.theta = wrap_angle(heading_ccw + theta_offset);
+
+    // Only use the reading if the read succeeded - a failed read leaves the
+    // event zeroed, which would look like a sudden jump to heading 0.
+    if (last_euler_read_ok) {
+      last_heading_deg_raw = orientation.orientation.x;
+      float heading_ccw = -radians(last_heading_deg_raw);
+      float new_theta = wrap_angle(heading_ccw - theta_offset);
+
+      d_theta = wrap_angle(new_theta - current_pose.theta);   // wrap-safe across +-pi
+      theta_mid = wrap_angle(current_pose.theta + 0.5f * d_theta);
+      current_pose.theta = new_theta;
+    }
   }
 
   // --- Position from PMW3901 optical flow, rotated into the global frame ---
   if (flow_ready) {
     flow_sensor->readMotionCount(&last_dx_counts, &last_dy_counts);
 
-    float dx_body = last_dx_counts * FLOW_METERS_PER_COUNT;
-    float dy_body = last_dy_counts * FLOW_METERS_PER_COUNT;
+    // Sensor axes -> body frame (x forward, y left), counts -> metres.
+    float fwd_counts  = FLOW_SWAP_XY ? last_dy_counts : last_dx_counts;
+    float left_counts = FLOW_SWAP_XY ? last_dx_counts : last_dy_counts;
+    float sx = fwd_counts  * FLOW_SIGN_FWD  * FLOW_METERS_PER_COUNT;
+    float sy = left_counts * FLOW_SIGN_LEFT * FLOW_METERS_PER_COUNT;
 
-    float c = cosf(current_pose.theta);
-    float s = sinf(current_pose.theta);
+    // An off-centre sensor sweeps along an arc when the robot rotates and
+    // reports that as movement: reported = true + (R(d_theta) - I) * offset.
+    // Subtract it so spinning on the spot doesn't move the pose.
+    float c = cosf(d_theta), s = sinf(d_theta);
+    float corr_x = (c - 1.0f) * FLOW_OFFSET_FWD_M  - s * FLOW_OFFSET_LEFT_M;
+    float corr_y = s * FLOW_OFFSET_FWD_M + (c - 1.0f) * FLOW_OFFSET_LEFT_M;
+    float dx_body = sx - corr_x;
+    float dy_body = sy - corr_y;
 
-    current_pose.x += dx_body * c - dy_body * s;
-    current_pose.y += dx_body * s + dy_body * c;
+    // Rotate into the world frame using the mid-step heading, then accumulate.
+    float ct = cosf(theta_mid);
+    float st = sinf(theta_mid);
+
+    current_pose.x += dx_body * ct - dy_body * st;
+    current_pose.y += dx_body * st + dy_body * ct;
   }
 
   return current_pose;

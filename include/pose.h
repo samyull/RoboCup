@@ -7,7 +7,10 @@
  * Robot pose in a fixed global frame.
  * x, y are in metres, theta is heading in radians, wrapped to [-pi, pi],
  * measured counter-clockwise from wherever the robot was pointing at
- * pose_init() (i.e. that starting heading is defined as theta = 0).
+ * pose_reset() (that starting heading is defined as theta = 0, and the
+ * robot's forward direction at that moment is the world +x axis).
+ *
+ * Body frame convention used inside pose.cpp: x = forward, y = left.
  */
 struct Pose {
   float x = 0.0f;
@@ -17,9 +20,10 @@ struct Pose {
 
 /**
  * Initialise the BNO055 IMU and the PMW3901 optical flow sensor.
- * Call once from setup(), after Serial.begin(). Halts with a Serial
- * message if either sensor fails to initialise, since dead reckoning
- * is meaningless without both.
+ * Call once from setup(), after Serial.begin(). If a sensor fails to
+ * initialise, a message is printed and pose_imu_ready()/pose_flow_ready()
+ * return false (the code does NOT halt) - check those before trusting
+ * the pose.
  *
  * @param flow_chip_select  the CS pin the PMW3901 is wired to
  */
@@ -27,8 +31,10 @@ void pose_init(uint8_t flow_chip_select);
 
 /**
  * Read both sensors and integrate the pose estimate forward by one step.
- * Call this every loop iteration, as close to a fixed rate as practical -
- * the optical flow scale factor below assumes a roughly constant loop time.
+ * Call this every loop iteration. The flow sensor reports counts
+ * accumulated since the last read, i.e. a displacement, so no loop-time
+ * (dt) is needed - but the counts are stored in an int16, so don't let
+ * the gap between calls get very long.
  *
  * @return the updated Pose (also available via pose_get())
  */
@@ -40,8 +46,8 @@ Pose pose_update();
 Pose pose_get();
 
 /**
- * Reset x, y, theta back to zero. Handy for re-anchoring when you know
- * the robot is at a known reference point.
+ * Reset x, y, theta back to zero, re-zero the heading to the current
+ * IMU heading, and discard any flow counts accumulated so far.
  */
 void pose_reset();
 
@@ -61,15 +67,14 @@ bool pose_flow_ready();
 
 /**
  * Scale factor converting raw PMW3901 motion counts to metres of travel.
- * The PMW3901 reports counts proportional to angular motion of the ground
- * pattern under the sensor, so the real-world distance per count depends
- * on height above the surface. This constant assumes a fixed, known
- * mounting height - MEASURE AND CALIBRATE THIS for your actual rover
- * rather than trusting the placeholder value.
+ * Each count is a fixed angle of view, so distance per count is
+ * proportional to height above the floor:
  *
- * Rough starting point for the PMW3901 at ~80mm height: ~0.035 mm/count,
- * i.e. 0.000035 m/count. Recalibrate by driving a known distance and
- * comparing to the accumulated count.
+ *     metres_per_count ~= height_m * 0.0021
+ *
+ * At 80 mm that is ~0.000168 m/count (0.168 mm/count). This is an
+ * estimate - CALIBRATE by pushing the robot a known distance, summing the
+ * raw counts, and setting FLOW_METERS_PER_COUNT = distance / counts.
  */
 extern float FLOW_METERS_PER_COUNT;
 
