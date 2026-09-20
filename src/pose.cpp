@@ -32,7 +32,7 @@ static const float FLOW_OFFSET_LEFT_M = -0.13825f;
 // State
 // ---------------------------------------------------------------------------
 
-static Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+static Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire1);
 static Bitcraze_PMW3901 *flow_sensor = nullptr;
 
 static Pose current_pose;
