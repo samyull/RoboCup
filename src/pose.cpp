@@ -3,6 +3,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <Bitcraze_PMW3901.h>
+#include <FastLED.h>
 
 // ---------------------------------------------------------------------------
 // Flow sensor calibration / mounting
@@ -27,6 +28,9 @@ static const float FLOW_SIGN_LEFT = -1.0f;   // flip to -1 if left push gives ne
 // spinning the robot makes it report fake translation, which is removed below.
 static const float FLOW_OFFSET_FWD_M  = -0.2105f;
 static const float FLOW_OFFSET_LEFT_M = -0.13825f;
+
+#define LED_PIN 30
+CRGBArray<16> leds;
 
 // ---------------------------------------------------------------------------
 // State
@@ -57,9 +61,20 @@ static float wrap_angle(float angle_rad) {
 // Init / reset (init sequence unchanged from the version that worked)
 // ---------------------------------------------------------------------------
 
+void backlight_init() {
+  FastLED.addLeds<NEOPIXEL,LED_PIN>(leds, 16);
+  FastLED.setBrightness(130);
+  for(int i=0; i < 16; i++) {
+    leds[i] = CRGB(255, 255, 255);
+  }
+  delay(2000);
+  FastLED.show();
+  Serial.println("Backlight initialised");
+}
+
 void pose_init(uint8_t flow_chip_select) {
   Wire.begin();
-  Wire.setClock(100000); // BNO055 can be finicky with I2C faster than 100kHz on fast MCUs
+  Wire.setClock(100000);
 
   if (!bno.begin()) {
     Serial.println("ERROR: BNO055 not detected - check wiring/address");

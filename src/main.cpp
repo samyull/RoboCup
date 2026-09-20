@@ -51,6 +51,7 @@ void setup() {
   motors_init();
   Serial.println("motors_init() done");
 
+  backlight_init();
   map_init();
 
   if (!MOTOR_TEST_MODE) {
@@ -107,7 +108,8 @@ void loop() {
     // Serial.print(" L="); Serial.print(left_pct);
     // Serial.print(" R="); Serial.println(right_pct);
 
-    set_motors(left_pct, right_pct);
+    // set_motors(left_pct, right_pct);
+    stop_motors();
   }
 
   delay(20); // ~50Hz control loop

@@ -29,6 +29,8 @@ struct Pose {
  */
 void pose_init(uint8_t flow_chip_select);
 
+void backlight_init();
+
 /**
  * Read both sensors and integrate the pose estimate forward by one step.
  * Call this every loop iteration. The flow sensor reports counts
