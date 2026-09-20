@@ -8,6 +8,7 @@
 // Flow sensor calibration / mounting
 // ---------------------------------------------------------------------------
 
+
 // Lens-to-floor height in metres. See pose.h - CALIBRATE FLOW_METERS_PER_COUNT
 // with a known-distance push test once this is set.
 float MOUNTING_HEIGHT = 0.08F;
@@ -17,15 +18,15 @@ float FLOW_METERS_PER_COUNT = MOUNTING_HEIGHT * 0.0021f;   // ~0.168 mm/count at
 // Push the robot forward, then to the left, and watch raw_dx / raw_dy in the
 // debug print. Set these so pushing forward makes x increase and pushing
 // left makes y increase.
-static const bool  FLOW_SWAP_XY   = false;  // true if the sensor's dy is the forward axis
-static const float FLOW_SIGN_FWD  = 1.0f;   // flip to -1 if forward push gives negative x
-static const float FLOW_SIGN_LEFT = 1.0f;   // flip to -1 if left push gives negative y
+static const bool  FLOW_SWAP_XY   = true;  // true if the sensor's dy is the forward axis
+static const float FLOW_SIGN_FWD  = -1.0f;   // flip to -1 if forward push gives negative x
+static const float FLOW_SIGN_LEFT = -1.0f;   // flip to -1 if left push gives negative y
 
 // Flow sensor position relative to the robot's centre of rotation, in metres
 // (forward, left). Leave at 0 if it sits over the centre. If it doesn't,
 // spinning the robot makes it report fake translation, which is removed below.
-static const float FLOW_OFFSET_FWD_M  = 0.0f;
-static const float FLOW_OFFSET_LEFT_M = 0.0f;
+static const float FLOW_OFFSET_FWD_M  = -0.2105f;
+static const float FLOW_OFFSET_LEFT_M = -0.13825f;
 
 // ---------------------------------------------------------------------------
 // State

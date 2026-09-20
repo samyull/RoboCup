@@ -14,7 +14,7 @@ static const uint8_t FLOW_CHIP_SELECT = 10;
 // upstream of them. Once you see the wheels actually turn, set to false.
 static const bool MOTOR_TEST_MODE = false;
 
-static Target test_target = {0.0f, 1.0f};
+static Target test_target = {1.0f, 0.0f};
 static bool arrived = false;
 
 void run_motor_test() {
@@ -71,6 +71,16 @@ void loop() {
   }
 
   Pose pose = pose_update();
+  if (!pose_imu_ready() || !pose_flow_ready()) {
+    stop_motors();
+    static uint32_t last_warn = 0;
+    if (millis() - last_warn > 1000) {
+      last_warn = millis();
+      Serial.println("SENSOR NOT READY - motors held off");
+    }
+    delay(20);
+    return;
+  }
   map_update(pose);
 
   // Debug print is slow (extra I2C reads) - throttle it to 5 Hz
