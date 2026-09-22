@@ -61,17 +61,6 @@ static float wrap_angle(float angle_rad) {
 // Init / reset (init sequence unchanged from the version that worked)
 // ---------------------------------------------------------------------------
 
-void backlight_init() {
-  FastLED.addLeds<NEOPIXEL,LED_PIN>(leds, 16);
-  FastLED.setBrightness(130);
-  for(int i=0; i < 16; i++) {
-    leds[i] = CRGB(255, 255, 255);
-  }
-  delay(2000);
-  FastLED.show();
-  Serial.println("Backlight initialised");
-}
-
 void pose_init(uint8_t flow_chip_select) {
   Wire.begin();
   Wire.setClock(100000);

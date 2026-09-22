@@ -7,7 +7,7 @@
 // Index order: [0]=Bottom R, [1]=Bottom L, [2]=Top R, [3]=Top L
 #define TOF_COUNT 4
 #define TOF_TOTAL_COUNT TOF_COUNT
-#define TOF_MAX_RANGE_MM 1000
+#define TOF_MAX_RANGE_MM 550
 
 // Initializes the SX1509 expander, resets all sensors via XSHUT, brings
 // each sensor up one at a time and assigns it a unique I2C address.

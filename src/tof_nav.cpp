@@ -1,12 +1,29 @@
 #include "tof_nav.h"
 #include <Arduino.h>
 
+// Relevant constants
+static const float MM_TO_M = 0.001f;
+static const float WALL_TOLERANCE_M = 0.05f; 
+static const float DETECTION_MAX_M = (float)(TOF_MAX_RANGE_MM - 50) * MM_TO_M;
+
 // Index order from TOFs.h
 static const uint8_t BOTTOM_R = 0, BOTTOM_L = 1, TOP_R = 2, TOP_L = 3;
 
-// Thresholds
-static const uint16_t WEIGHT_MM   = TOF_MAX_RANGE_MM; // bottom < this = weight
-static const uint16_t OBSTACLE_MM = 200;              // top < this = not a weight
+// TOF offsets
+static const float TOP_LEFT_FWD_M    =  0.1506f;
+static const float TOP_LEFT_LEFT_M   =  0.06164f;
+static const float BOTTOM_LEFT_FWD_M =  0.174f;
+static const float BOTTOM_LEFT_LEFT_M=  0.06164f;
+
+static const float TOP_RIGHT_FWD_M    =  0.1506f;
+static const float TOP_RIGHT_LEFT_M   = -0.08975f;
+static const float BOTTOM_RIGHT_FWD_M =  0.174f;
+static const float BOTTOM_RIGHT_LEFT_M= -0.08975f;
+
+// // Thresholds
+// static const float DETECTION_M = 0.3;
+// static const uint16_t WEIGHT_MM   = TOF_MAX_RANGE_MM; // bottom < this = weight
+// static const uint16_t OBSTACLE_MM = 200;              // top < this = not a weight
 
 // Speeds (percent)
 static const int APPROACH_SPEED = 40;
@@ -26,72 +43,40 @@ static uint32_t prev_ms     = 0;
 static uint32_t last_seen_ms = 0;
 static bool     ever_seen   = false;
 
-TofNavState tof_nav_update(const uint16_t ranges[TOF_TOTAL_COUNT],
-                           int &left_pct, int &right_pct) {
-  uint32_t now = millis();
+void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], Pose pose) {
+  float topRight = (float)ranges[TOP_R] * MM_TO_M;
+  float topLeft = (float)ranges[TOP_L] * MM_TO_M;
+  float bottomRight = (float)ranges[BOTTOM_R] * MM_TO_M;
+  float bottomLeft = (float)ranges[BOTTOM_L] * MM_TO_M;
 
-  // 1) Obstacle avoidance has priority: a top sensor reading < 200 is not a weight.
-  bool tr = ranges[TOP_R] < OBSTACLE_MM;
-  bool tl = ranges[TOP_L] < OBSTACLE_MM;
-  if (tr || tl) {
-    bool turn_left;
-    if (tr && tl) turn_left = ranges[TOP_R] <= ranges[TOP_L]; // turn away from the closer one
-    else          turn_left = tr;                              // obstacle on right -> turn left
+  bool weightRight = fabs(topRight - bottomRight) > WALL_TOLERANCE_M && bottomRight < DETECTION_MAX_M;
+  bool weightLeft = fabs(topLeft - bottomLeft) > WALL_TOLERANCE_M && bottomLeft < DETECTION_MAX_M;
 
-    if (turn_left) { left_pct = -AVOID_SPEED; right_pct =  AVOID_SPEED; }
-    else           { left_pct =  AVOID_SPEED; right_pct = -AVOID_SPEED; }
+  bool wallRight = topRight < DETECTION_MAX_M;
+  bool wallLeft = topLeft < DETECTION_MAX_M;
 
-    prev_valid = false;
-    ever_seen  = false;
-    return TOF_NAV_AVOID;
+
+  // Right side
+  if(weightRight) {
+    // Weight detected right side, write it to the grid @ current pos + heading * bottomRight
+  }
+  if(wallRight) {
+    // Wall detected right side, write it to the grid @ current pos + heading * avg(bottomRight, topRight)
+    float wallDist = !weightRight ? (bottomRight + topRight) * 0.5f : topRight;
+  }
+  if(!wallRight && !weightRight) {
+    // Nothing detected right side, write free space to the grid in a line from current pos to heading * DETECTION_MAX_M
   }
 
-  // 2) Weight tracking with the bottom sensors.
-  bool r_seen = ranges[BOTTOM_R] < WEIGHT_MM;
-  bool l_seen = ranges[BOTTOM_L] < WEIGHT_MM;
-
-  if (r_seen || l_seen) {
-    // error > 0 means turn right, error < 0 means turn left
-    float error;
-    if (r_seen && l_seen) {
-      // Both see it: equalise the distances to keep it centred.
-      error = ((float)ranges[BOTTOM_L] - (float)ranges[BOTTOM_R]) / BOTH_SEEN_SCALE_MM;
-      if (error >  1.0f) error =  1.0f;
-      if (error < -1.0f) error = -1.0f;
-    } else {
-      // Only one sees it: turn gently towards that side.
-      error = r_seen ? ONE_SIDE_ERROR : -ONE_SIDE_ERROR;
-    }
-
-    float derivative = 0.0f;
-    if (prev_valid && now > prev_ms) {
-      derivative = (error - prev_error) / ((now - prev_ms) / 1000.0f);
-    }
-    prev_error = error;
-    prev_ms    = now;
-    prev_valid = true;
-
-    float turn = KP * error + KD * derivative;
-    if (turn >  MAX_TURN) turn =  MAX_TURN;
-    if (turn < -MAX_TURN) turn = -MAX_TURN;
-
-    left_pct  = APPROACH_SPEED + (int)turn;
-    right_pct = APPROACH_SPEED - (int)turn;
-
-    last_seen_ms = now;
-    ever_seen    = true;
-    return TOF_NAV_WEIGHT;
+  // Left side
+  if(weightLeft) {
+    // Weight detected right side, write it to the grid @ current pos + heading * bottomRight
   }
-
-  // 3) Weight just dropped out of view (likely between the two narrow beams):
-  //    keep driving straight for a short time.
-  if (ever_seen && (now - last_seen_ms) < HOLD_MS) {
-    left_pct = right_pct = APPROACH_SPEED;
-    prev_valid = false;
-    return TOF_NAV_WEIGHT;
+  if(wallLeft) {
+    // Wall detected right side, write it to the grid @ current pos + heading * avg(bottomRight, topRight)
+    float wallDist = !weightLeft ? (bottomLeft + topLeft) * 0.5f : topRight;
   }
-
-  prev_valid = false;
-  ever_seen  = false;
-  return TOF_NAV_CLEAR;
+  if(!wallLeft && !weightLeft) {
+    // Nothing detected right side, write free space to the grid in a line from current pos to heading * DETECTION_MAX_M
+  }
 }

@@ -3,45 +3,16 @@
 #include "pose.h"
 #include "navigation.h"
 #include "grid_map.h"
+#include "TOFs.h"
+#include "tof_nav.h"
 
-// TODO: change to whatever pin the PMW3901's CS line is actually wired to
 static const uint8_t FLOW_CHIP_SELECT = 10;
-
-// --- DEBUG MODE ---
-// Set to true first: this bypasses sensors/navigation entirely and just
-// pulses the motors directly, so you can confirm the motor driver boards,
-// wiring, and pin numbers are actually correct before trusting anything
-// upstream of them. Once you see the wheels actually turn, set to false.
-static const bool MOTOR_TEST_MODE = false;
 
 static Target test_target = {1.0f, 0.0f};
 static bool arrived = false;
 
-void run_motor_test() {
-  Serial.println("--- MOTOR TEST: forward ---");
-  set_motors(90, 90);
-  delay(1500);
-
-  Serial.println("--- MOTOR TEST: stop ---");
-  set_motors(0, 0);
-  delay(1000);
-
-  Serial.println("--- MOTOR TEST: backward ---");
-  set_motors(-90, -90);
-  delay(1500);
-
-  Serial.println("--- MOTOR TEST: stop ---");
-  set_motors(0, 0);
-  delay(1000);
-
-  Serial.println("--- MOTOR TEST: spin (left back, right fwd) ---");
-  set_motors(-90, 90);
-  delay(1500);
-
-  Serial.println("--- MOTOR TEST: stop ---");
-  set_motors(0, 0);
-  delay(1000);
-}
+static int left_pct, right_pct;
+static uint16_t ranges[TOF_TOTAL_COUNT];
 
 void setup() {
   Serial.begin(115200);
@@ -49,28 +20,46 @@ void setup() {
   Serial.println("=== BOOT ===");
 
   motors_init();
-  Serial.println("motors_init() done");
+  Serial.println("Motors initialized");
 
-  backlight_init();
   map_init();
+  Serial.println("Map initialised");
 
-  if (!MOTOR_TEST_MODE) {
-    pose_init(FLOW_CHIP_SELECT);
-    Serial.print("pose_init() done - imu_ready=");
-    Serial.print(pose_imu_ready());
-    Serial.print(" flow_ready=");
-    Serial.println(pose_flow_ready());
+  pose_init(FLOW_CHIP_SELECT);
+  Serial.print("pose_init() done - imu_ready=");
+  Serial.print(pose_imu_ready());
+  Serial.print(" flow_ready=");
+  Serial.println(pose_flow_ready());
+
+  if (!tof_init()) {
+    Serial.println("WARNING: one or more TOF sensors failed to initialize");
+  } else {
+    Serial.println("All TOF sensors initialized");
   }
 
   Serial.println("=== SETUP COMPLETE ===");
 }
 
-void loop() {
-  if (MOTOR_TEST_MODE) {
-    run_motor_test();
-    return; // repeats the test sequence forever
-  }
+void print_debugging_info(uint16_t ranges[TOF_TOTAL_COUNT]) {
+  // Prints the current serial log number (how many times serial has printed)
+  int count=1;
+  Serial.print("LOG"); Serial.print(count);
+  count++;
+  
+  Serial.print("BOT R (L0): "); Serial.print(ranges[0]);
+  if (tof_timeout_occurred(0)) Serial.print(" TIMEOUT");
+  Serial.print(" | BOT L (L0): "); Serial.print(ranges[1]);
+  if (tof_timeout_occurred(1)) Serial.print(" TIMEOUT");
+  Serial.print(" | TOP R (L1): "); Serial.print(ranges[2]);
+  if (tof_timeout_occurred(2)) Serial.print(" TIMEOUT");
+  Serial.print(" | TOP L (L1): "); Serial.print(ranges[3]);
+  if (tof_timeout_occurred(3)) Serial.print(" TIMEOUT");
+  Serial.println();
 
+
+}
+
+void loop() {
   Pose pose = pose_update();
   if (!pose_imu_ready() || !pose_flow_ready()) {
     stop_motors();
@@ -91,6 +80,13 @@ void loop() {
     pose_print_debug();
   }
 
+  tof_read(ranges);
+
+  tof_classify_readings(ranges, pose);
+
+  print_debugging_info(ranges);
+
+
   if (!arrived && has_arrived(pose, test_target)) {
     arrived = true;
     stop_motors();
@@ -98,7 +94,6 @@ void loop() {
   }
 
   if (!arrived) {
-    int left_pct, right_pct;
     navigate_to_target(pose, test_target, left_pct, right_pct);
 
     // float err = heading_error_to(pose, test_target);
@@ -111,6 +106,13 @@ void loop() {
     // set_motors(left_pct, right_pct);
     stop_motors();
   }
+
+  // if (tof_nav_update(ranges, left_pct, right_pct) != TOF_NAV_CLEAR) {
+  //   set_motors(left_pct, right_pct);
+  // } else {
+  //   set_motors(3000, 3000);   // default driving, replace with navigate_to_target() later
+  // }
+
 
   delay(20); // ~50Hz control loop
 }
