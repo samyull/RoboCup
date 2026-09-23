@@ -39,6 +39,27 @@ bool has_arrived(const Pose &pose, const Target &target) {
     return distance_to(pose, target) <= ARRIVAL_RADIUS_M;
 }
 
+bool find_nearest_weight(const Pose &pose, Target &target) {
+  int robot_gx, robot_gy;
+  int least_dist = MAP_GRID_H*MAP_GRID_H + MAP_GRID_W*MAP_GRID_W + 1;
+
+  world_to_grid(pose.x, pose.y, robot_gx, robot_gy);
+  
+  for(int i=0; i < MAP_GRID_W; i++) {
+    for(int j=0; j < MAP_GRID_H; j++) {
+        if(map_get_cell(i, j) == MAP_CELL_WEIGHT) {
+            int dist = (i - robot_gx)*(i - robot_gx) + (j - robot_gy)*(j - robot_gy);
+            if(dist < least_dist) {
+                grid_to_world(i, j, target.x, target.y);
+                least_dist = dist;
+            }
+        }
+    }
+  }
+
+  return least_dist < MAP_GRID_H*MAP_GRID_H + MAP_GRID_W*MAP_GRID_W + 1;
+}
+
 void navigate_to_target(const Pose &pose, const Target &target, int &out_left_pct, int &out_right_pct) {
     float err = heading_error_to(pose, target);
     float dist = distance_to(pose, target);

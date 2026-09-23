@@ -1,5 +1,6 @@
 #include "tof_nav.h"
 #include <Arduino.h>
+#include "grid_map.h"
 
 // Relevant constants
 static const float MM_TO_M = 0.001f;
@@ -20,30 +21,21 @@ static const float TOP_RIGHT_LEFT_M   = -0.08975f;
 static const float BOTTOM_RIGHT_FWD_M =  0.174f;
 static const float BOTTOM_RIGHT_LEFT_M= -0.08975f;
 
-// // Thresholds
-// static const float DETECTION_M = 0.3;
-// static const uint16_t WEIGHT_MM   = TOF_MAX_RANGE_MM; // bottom < this = weight
-// static const uint16_t OBSTACLE_MM = 200;              // top < this = not a weight
+static void project_point(const Pose &pose, float fwd_offset, float left_offset, float distance, float &x_m, float &y_m) {
+  // Get the position of detected point in terms of body reference frame
+  float body_fwd = fwd_offset + distance;
+  float body_left = left_offset;
 
-// Speeds (percent)
-static const int APPROACH_SPEED = 40;
-static const int AVOID_SPEED    = 40;   // spin-in-place speed
+  // Cosine and sine
+  float c = cosf(pose.theta);
+  float s = sinf(pose.theta);
 
-// PD tuning: starting values, tune on the robot
-static const float KP        = 35.0f;
-static const float KD        = 1.5f;
-static const float MAX_TURN  = 40.0f;
-static const float BOTH_SEEN_SCALE_MM = 200.0f; // L-R difference that gives full error
-static const float ONE_SIDE_ERROR     = 0.5f;   // error when only one sensor sees it
-static const uint32_t HOLD_MS = 400;  // keep driving straight after the weight drops out of view
+  // Convert to world frame
+  x_m = pose.x + body_fwd * c - body_left * s;
+  y_m = pose.y + body_fwd * s + body_left * c;
+}
 
-static float    prev_error  = 0.0f;
-static bool     prev_valid  = false;
-static uint32_t prev_ms     = 0;
-static uint32_t last_seen_ms = 0;
-static bool     ever_seen   = false;
-
-void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], Pose pose) {
+void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose &pose) {
   float topRight = (float)ranges[TOP_R] * MM_TO_M;
   float topLeft = (float)ranges[TOP_L] * MM_TO_M;
   float bottomRight = (float)ranges[BOTTOM_R] * MM_TO_M;
@@ -55,28 +47,77 @@ void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], Pose pose) {
   bool wallRight = topRight < DETECTION_MAX_M;
   bool wallLeft = topLeft < DETECTION_MAX_M;
 
+  float origin_x, origin_y;
+  float reading_x_m, reading_y_m;
+  int reading_gx, reading_gy;
 
   // Right side
-  if(weightRight) {
+  if (weightRight) {
     // Weight detected right side, write it to the grid @ current pos + heading * bottomRight
+    project_point(pose, BOTTOM_RIGHT_FWD_M, BOTTOM_RIGHT_LEFT_M, 0.0f, origin_x, origin_y);
+    project_point(pose, BOTTOM_RIGHT_FWD_M, BOTTOM_RIGHT_LEFT_M, bottomRight, reading_x_m, reading_y_m);
+
+    map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
+
+    world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
+    map_set_cell(reading_gx, reading_gy, MAP_CELL_WEIGHT);
   }
   if(wallRight) {
     // Wall detected right side, write it to the grid @ current pos + heading * avg(bottomRight, topRight)
     float wallDist = !weightRight ? (bottomRight + topRight) * 0.5f : topRight;
+
+    project_point(pose, TOP_RIGHT_FWD_M, TOP_RIGHT_LEFT_M, 0.0f, origin_x, origin_y);
+    project_point(pose, TOP_RIGHT_FWD_M, TOP_RIGHT_LEFT_M, wallDist, reading_x_m, reading_y_m);
+
+    map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
+
+    world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
+    map_set_cell(reading_gx, reading_gy, MAP_CELL_OBSTACLE);
+
   }
   if(!wallRight && !weightRight) {
     // Nothing detected right side, write free space to the grid in a line from current pos to heading * DETECTION_MAX_M
+    
+    project_point(pose, TOP_RIGHT_FWD_M, TOP_RIGHT_LEFT_M, 0.0f, origin_x, origin_y);
+    project_point(pose, TOP_RIGHT_FWD_M, TOP_RIGHT_LEFT_M, DETECTION_MAX_M, reading_x_m, reading_y_m);
+
+    map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
+
+    world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
+    map_set_cell(reading_gx, reading_gy, MAP_CELL_FREE);
   }
 
   // Left side
   if(weightLeft) {
-    // Weight detected right side, write it to the grid @ current pos + heading * bottomRight
+    // Weight detected left side, write it to the grid @ current pos + heading * bottomLeft
+    project_point(pose, BOTTOM_LEFT_FWD_M, BOTTOM_LEFT_LEFT_M, 0.0f, origin_x, origin_y);
+    project_point(pose, BOTTOM_LEFT_FWD_M, BOTTOM_LEFT_LEFT_M, bottomLeft, reading_x_m, reading_y_m);
+
+    map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
+
+    world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
+    map_set_cell(reading_gx, reading_gy, MAP_CELL_WEIGHT);
   }
   if(wallLeft) {
     // Wall detected right side, write it to the grid @ current pos + heading * avg(bottomRight, topRight)
-    float wallDist = !weightLeft ? (bottomLeft + topLeft) * 0.5f : topRight;
+    float wallDist = !weightLeft ? (bottomLeft + topLeft) * 0.5f : topLeft;
+
+    project_point(pose, TOP_LEFT_FWD_M, TOP_LEFT_LEFT_M, 0.0f, origin_x, origin_y);
+    project_point(pose, TOP_LEFT_FWD_M, TOP_LEFT_LEFT_M, wallDist, reading_x_m, reading_y_m);
+
+    map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
+
+    world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
+    map_set_cell(reading_gx, reading_gy, MAP_CELL_OBSTACLE);
   }
   if(!wallLeft && !weightLeft) {
     // Nothing detected right side, write free space to the grid in a line from current pos to heading * DETECTION_MAX_M
+    project_point(pose, TOP_LEFT_FWD_M, TOP_LEFT_LEFT_M, 0.0f, origin_x, origin_y);
+    project_point(pose, TOP_LEFT_FWD_M, TOP_LEFT_LEFT_M, DETECTION_MAX_M, reading_x_m, reading_y_m);
+
+    map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
+
+    world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
+    map_set_cell(reading_gx, reading_gy, MAP_CELL_FREE);
   }
 }

@@ -17,6 +17,7 @@ enum MapCell : int8_t {
   MAP_CELL_FREE     = 0,
   MAP_CELL_OBSTACLE = 1,
   MAP_CELL_ROBOT    = 2,
+  MAP_CELL_WEIGHT   = 3
 };
 
 /** Fill the grid with MAP_CELL_UNKNOWN. Call once from setup(). */
@@ -35,10 +36,15 @@ void map_update(const Pose &pose);
  */
 bool world_to_grid(float x_m, float y_m, int &gx, int &gy);
 
+void grid_to_world(int gx, int gy, float &x_m, float &y_m);
+
 /** @return the cell value, or MAP_CELL_UNKNOWN if (gx, gy) is off the grid. */
 int8_t map_get_cell(int gx, int gy);
 
 /** Write a cell value (ignored if off the grid) and log it over Serial. */
 void map_set_cell(int gx, int gy, int8_t value);
+
+// Traces a line of free spaces in the grid from robot's pose to a given TOF reading
+void map_ray_trace(float x0_m, float y0_m, float x1_m, float y1_m);
 
 #endif // GRID_MAP_H

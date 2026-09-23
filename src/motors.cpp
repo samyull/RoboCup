@@ -1,6 +1,6 @@
 #include "motors.h"
-#include "Arduino.h"
-#include "Servo.h"
+#include <Arduino.h>
+#include <Servo.h>
 
 Servo right_motor;
 Servo left_motor;
