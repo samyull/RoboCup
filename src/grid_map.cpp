@@ -61,7 +61,7 @@ void map_ray_trace(float x0_m, float y0_m, float x1_m, float y1_m) {
       err += dy;
       x += sx;
     }
-    if(e2 >= dx) {
+    if(e2 <= dx) {
       err += dx;
       y += sy;
     }

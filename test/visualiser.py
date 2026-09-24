@@ -42,11 +42,15 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.animation import FuncAnimation
 
 # --- Must match grid_map.h on the robot ---
-GRID_W = 100
-GRID_H = 100
+GRID_SIZE_X_M = 4.0
+GRID_SIZE_Y_M = 2.0
 CELL_SIZE_M = 0.05
-X_ZERO = GRID_W // 2
-Y_ZERO = GRID_H // 2
+MARGIN_CELLS = 6
+
+GRID_W = int(GRID_SIZE_X_M / CELL_SIZE_M) + 2 * MARGIN_CELLS
+GRID_H = int(GRID_SIZE_Y_M / CELL_SIZE_M) + 2 * MARGIN_CELLS
+X_ZERO = MARGIN_CELLS
+Y_ZERO = MARGIN_CELLS
 
 BAUD_RATE = 115200
 
@@ -96,17 +100,19 @@ class Visualiser:
         bounds = [v - 0.5 for v in CELL_VALUES] + [CELL_VALUES[-1] + 0.5]
         norm = BoundaryNorm(bounds, cmap.N)
 
-        world_x0, world_y0 = grid_to_world(0, 0)
-        world_x1, world_y1 = grid_to_world(GRID_W, GRID_H)
+        # Cell edges in world coordinates, for pcolormesh (needs edges, not
+        # centres) - one more edge than there are cells in each direction.
+        x_edges = np.array([grid_to_world(gx, 0)[0] for gx in range(GRID_W + 1)])
+        y_edges = np.array([grid_to_world(0, gy)[1] for gy in range(GRID_H + 1)])
 
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
-        self.im = self.ax.imshow(
-            self.grid, cmap=cmap, norm=norm, origin="lower",
-            extent=[world_x0, world_x1, world_y0, world_y1],
-            interpolation="nearest",
+        self.mesh = self.ax.pcolormesh(
+            x_edges, y_edges, self.grid, cmap=cmap, norm=norm,
+            edgecolors="black", linewidth=0.4,
         )
+        self.ax.set_aspect("equal")
         self.pose_dot, = self.ax.plot([], [], "o", color=POSE_COLOR,
-                                       markersize=10, label="pose")
+                                       markersize=4, label="pose")
         self.target_dot, = self.ax.plot([], [], "o", color=TARGET_COLOR,
                                          markersize=10, label="target")
         self.ax.set_xlabel("x (m)")
@@ -152,14 +158,14 @@ class Visualiser:
     def update(self, _frame):
         self._read_serial()
 
-        self.im.set_data(self.grid)
+        self.mesh.set_array(self.grid.ravel())
 
         if self.pose is not None:
             self.pose_dot.set_data([self.pose[0]], [self.pose[1]])
         if self.target is not None:
             self.target_dot.set_data([self.target[0]], [self.target[1]])
 
-        return self.im, self.pose_dot, self.target_dot
+        return self.mesh, self.pose_dot, self.target_dot
 
     def run(self):
         anim = FuncAnimation(self.fig, self.update, interval=100, blit=False)

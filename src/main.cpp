@@ -14,6 +14,8 @@ static bool arrived = false;
 static int left_pct, right_pct;
 static uint16_t ranges[TOF_TOTAL_COUNT];
 
+static int log_count = 1;
+
 void setup() {
   Serial.begin(115200);
   delay(2000); // give Serial time to come up on Teensy AND time for you to open the monitor
@@ -42,9 +44,8 @@ void setup() {
 
 void print_debugging_info(uint16_t ranges[TOF_TOTAL_COUNT]) {
   // Prints the current serial log number (how many times serial has printed)
-  int count=1;
-  Serial.print("LOG"); Serial.print(count);
-  count++;
+  Serial.print("LOG "); Serial.print(log_count);
+  log_count++;
   
   Serial.print("BOT R (L0): "); Serial.print(ranges[0]);
   if (tof_timeout_occurred(0)) Serial.print(" TIMEOUT");
@@ -72,6 +73,10 @@ void loop() {
     return;
   }
   map_update(pose);
+  Serial.println("CP1: after map_update");
+  Serial.print("P,"); Serial.print(pose.x, 3); Serial.print(",");
+  Serial.print(pose.y, 3); Serial.print(","); Serial.println(pose.theta, 4);
+  Serial.println("CP2: after pose print");
 
   // Debug print is slow (extra I2C reads) - throttle it to 5 Hz
   static uint32_t last_debug_ms = 0;
@@ -81,8 +86,10 @@ void loop() {
   }
 
   tof_read(ranges);
+  Serial.println("CP3: after tof_read");
 
   tof_classify_readings(ranges, pose);
+  Serial.println("CP4: after tof_classify_readings");
 
   print_debugging_info(ranges);
 

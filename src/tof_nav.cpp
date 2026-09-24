@@ -57,6 +57,9 @@ void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose &p
     project_point(pose, BOTTOM_RIGHT_FWD_M, BOTTOM_RIGHT_LEFT_M, 0.0f, origin_x, origin_y);
     project_point(pose, BOTTOM_RIGHT_FWD_M, BOTTOM_RIGHT_LEFT_M, bottomRight, reading_x_m, reading_y_m);
 
+    Serial.print("ray: "); Serial.print(origin_x); Serial.print(",");
+    Serial.print(origin_y); Serial.print(" -> "); Serial.print(reading_x_m);
+    Serial.print(","); Serial.println(reading_y_m);
     map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
 
     world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
@@ -69,6 +72,9 @@ void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose &p
     project_point(pose, TOP_RIGHT_FWD_M, TOP_RIGHT_LEFT_M, 0.0f, origin_x, origin_y);
     project_point(pose, TOP_RIGHT_FWD_M, TOP_RIGHT_LEFT_M, wallDist, reading_x_m, reading_y_m);
 
+    Serial.print("ray: "); Serial.print(origin_x); Serial.print(",");
+    Serial.print(origin_y); Serial.print(" -> "); Serial.print(reading_x_m);
+    Serial.print(","); Serial.println(reading_y_m);
     map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
 
     world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
@@ -81,6 +87,9 @@ void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose &p
     project_point(pose, TOP_RIGHT_FWD_M, TOP_RIGHT_LEFT_M, 0.0f, origin_x, origin_y);
     project_point(pose, TOP_RIGHT_FWD_M, TOP_RIGHT_LEFT_M, DETECTION_MAX_M, reading_x_m, reading_y_m);
 
+    Serial.print("ray: "); Serial.print(origin_x); Serial.print(",");
+    Serial.print(origin_y); Serial.print(" -> "); Serial.print(reading_x_m);
+    Serial.print(","); Serial.println(reading_y_m);
     map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
 
     world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
@@ -93,6 +102,9 @@ void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose &p
     project_point(pose, BOTTOM_LEFT_FWD_M, BOTTOM_LEFT_LEFT_M, 0.0f, origin_x, origin_y);
     project_point(pose, BOTTOM_LEFT_FWD_M, BOTTOM_LEFT_LEFT_M, bottomLeft, reading_x_m, reading_y_m);
 
+    Serial.print("ray: "); Serial.print(origin_x); Serial.print(",");
+    Serial.print(origin_y); Serial.print(" -> "); Serial.print(reading_x_m);
+    Serial.print(","); Serial.println(reading_y_m);
     map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
 
     world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
@@ -105,6 +117,9 @@ void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose &p
     project_point(pose, TOP_LEFT_FWD_M, TOP_LEFT_LEFT_M, 0.0f, origin_x, origin_y);
     project_point(pose, TOP_LEFT_FWD_M, TOP_LEFT_LEFT_M, wallDist, reading_x_m, reading_y_m);
 
+    Serial.print("ray: "); Serial.print(origin_x); Serial.print(",");
+    Serial.print(origin_y); Serial.print(" -> "); Serial.print(reading_x_m);
+    Serial.print(","); Serial.println(reading_y_m);
     map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
 
     world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);
@@ -115,6 +130,9 @@ void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose &p
     project_point(pose, TOP_LEFT_FWD_M, TOP_LEFT_LEFT_M, 0.0f, origin_x, origin_y);
     project_point(pose, TOP_LEFT_FWD_M, TOP_LEFT_LEFT_M, DETECTION_MAX_M, reading_x_m, reading_y_m);
 
+    Serial.print("ray: "); Serial.print(origin_x); Serial.print(",");
+    Serial.print(origin_y); Serial.print(" -> "); Serial.print(reading_x_m);
+    Serial.print(","); Serial.println(reading_y_m);
     map_ray_trace(origin_x, origin_y, reading_x_m, reading_y_m);
 
     world_to_grid(reading_x_m, reading_y_m, reading_gx, reading_gy);

@@ -6,11 +6,17 @@
 
 // Grid geometry. 100 x 100 cells at 5 cm = 5 m x 5 m, using ~10 KB of RAM.
 // The world origin (where the robot boots) sits in the middle of the grid.
-#define MAP_GRID_W      100
-#define MAP_GRID_H      100
-#define MAP_CELL_SIZE_M 0.05f
-#define MAP_X_ZERO      (MAP_GRID_W / 2)
-#define MAP_Y_ZERO      (MAP_GRID_H / 2)
+#define MAP_CELL_SIZE_M     0.05f
+#define MAP_MARGIN_CELLS    6        // padding around the arena, in cells
+
+#define MAP_GRID_SIZE_X_M   4.0f     // long side - TODO: confirm before match
+#define MAP_GRID_SIZE_Y_M   2.0f     // short side - TODO: confirm before match
+
+#define MAP_GRID_W ((int)(MAP_GRID_SIZE_X_M / MAP_CELL_SIZE_M) + 2 * MAP_MARGIN_CELLS)
+#define MAP_GRID_H ((int)(MAP_GRID_SIZE_Y_M / MAP_CELL_SIZE_M) + 2 * MAP_MARGIN_CELLS)
+
+#define MAP_X_ZERO MAP_MARGIN_CELLS
+#define MAP_Y_ZERO MAP_MARGIN_CELLS
 
 enum MapCell : int8_t {
   MAP_CELL_UNKNOWN  = -1,

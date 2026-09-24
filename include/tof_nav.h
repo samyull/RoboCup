@@ -6,5 +6,5 @@
 #include "pose.h"
 
 
-void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose pose);
+void tof_classify_readings(const uint16_t ranges[TOF_TOTAL_COUNT], const Pose &pose);
 #endif
