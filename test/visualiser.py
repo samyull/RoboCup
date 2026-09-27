@@ -42,15 +42,11 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.animation import FuncAnimation
 
 # --- Must match grid_map.h on the robot ---
-GRID_SIZE_X_M = 4.0
-GRID_SIZE_Y_M = 2.0
+GRID_W = 100
+GRID_H = 100
 CELL_SIZE_M = 0.05
-MARGIN_CELLS = 6
-
-GRID_W = int(GRID_SIZE_X_M / CELL_SIZE_M) + 2 * MARGIN_CELLS
-GRID_H = int(GRID_SIZE_Y_M / CELL_SIZE_M) + 2 * MARGIN_CELLS
-X_ZERO = MARGIN_CELLS
-Y_ZERO = MARGIN_CELLS
+X_ZERO = GRID_W // 2
+Y_ZERO = GRID_H // 2
 
 BAUD_RATE = 115200
 
@@ -75,6 +71,10 @@ TARGET_COLOR = "#FF8C00"  # orange
 
 CELL_VALUES = [CELL_UNKNOWN, CELL_FREE, CELL_OBSTACLE, CELL_ROBOT, CELL_WEIGHT]
 
+# Matches StateMachine's enum order in state_machine.h
+STATE_NAMES = ["NAVIGATION", "APPROACH_VERIFY", "APPROACH_WEIGHT",
+               "SCANNING", "RETURN_HOME", "DROP_OFF"]
+
 # Matches optional lines like "[pose] ... x=1.234 y=-0.567 theta_deg=12.3"
 # as a fallback if you're not printing a dedicated P, line yet.
 POSE_DEBUG_RE = re.compile(
@@ -94,6 +94,9 @@ class Visualiser:
         self.grid = np.full((GRID_H, GRID_W), CELL_UNKNOWN, dtype=int)
         self.pose = None    # (x_m, y_m, theta_rad or None)
         self.target = None  # (x_m, y_m)
+        self.motors = None  # (left_pct, right_pct)
+        self.state_info = None   # (state_int, busy_int)
+        self.diag = None    # raw text of the last D, line
         self._buf = ""
 
         cmap = ListedColormap(CELL_COLORS)
@@ -120,6 +123,12 @@ class Visualiser:
         self.ax.set_title("Occupancy grid")
         self.ax.legend(loc="upper right")
 
+        self.info_text = self.ax.text(
+            0.02, 0.98, "", transform=self.ax.transAxes,
+            verticalalignment="top", fontsize=9, family="monospace",
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+        )
+
     def _handle_line(self, line):
         parts = line.strip().split(",")
         if not parts or not parts[0]:
@@ -137,6 +146,15 @@ class Visualiser:
 
             elif tag == "T" and len(parts) == 3:
                 self.target = (float(parts[1]), float(parts[2]))
+
+            elif tag == "M" and len(parts) == 3:
+                self.motors = (int(parts[1]), int(parts[2]))
+
+            elif tag == "S" and len(parts) == 3:
+                self.state_info = (int(parts[1]), int(parts[2]))
+
+            elif tag == "D":
+                self.diag = line.strip()[2:]   # drop the "D," prefix
 
             else:
                 m = POSE_DEBUG_RE.search(line)
@@ -165,7 +183,18 @@ class Visualiser:
         if self.target is not None:
             self.target_dot.set_data([self.target[0]], [self.target[1]])
 
-        return self.mesh, self.pose_dot, self.target_dot
+        lines = []
+        if self.motors is not None:
+            lines.append(f"motors: L={self.motors[0]:>4} R={self.motors[1]:>4}")
+        if self.state_info is not None:
+            state_num, busy = self.state_info
+            name = STATE_NAMES[state_num] if 0 <= state_num < len(STATE_NAMES) else f"?{state_num}"
+            lines.append(f"state:  {name}  busy={bool(busy)}")
+        if self.diag is not None:
+            lines.append(f"sensors: {self.diag}")
+        self.info_text.set_text("\n".join(lines))
+
+        return self.mesh, self.pose_dot, self.target_dot, self.info_text
 
     def run(self):
         anim = FuncAnimation(self.fig, self.update, interval=100, blit=False)
