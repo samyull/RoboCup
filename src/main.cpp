@@ -21,6 +21,7 @@ void setup() {
   Serial.println("=== BOOT ===");
 
   motors_init();
+  backlight_init();
   map_init();
 
   pose_init(FLOW_CHIP_SELECT);
@@ -89,6 +90,17 @@ void loop() {
     state_machine_update(pose, ranges, weight_seen_this_frame, left_pct, right_pct);
     set_motors(left_pct, right_pct);
   }
+
+  // Debug: motor output and state, for the visualiser / bench debugging.
+  Serial.print("M,"); Serial.print(left_pct); Serial.print(","); Serial.println(right_pct);
+  Serial.print("S,"); Serial.print((int)state_machine_current_state());
+  Serial.print(","); Serial.println(weight_collection_busy());
+
+  // Debug: raw catchment sensor readings - if IR proximity reads "detected"
+  // with nothing in front of it, the pin is very likely floating.
+  Serial.print("D,ind="); Serial.print(induction_read());
+  Serial.print(",ind_det="); Serial.print(induction_detected());
+  Serial.print(",ir_det="); Serial.println(ir_proximity_detected());
 
   delay(20); // ~50Hz control loop
 }
