@@ -1,11 +1,13 @@
 #include "navigation.h"
+#include "grid_map.h"
 #include <Arduino.h>
 
-float ARRIVAL_RADIUS_M = 0.05f; // 5cm
+float ARRIVAL_RADIUS_M = 0.05f;         // 5cm - corner/waypoint tolerance
+float WEIGHT_ARRIVAL_RADIUS_M = 0.10f;  // 10cm (~2 grid cells) - weight fallback tolerance
 
-static const int MAX_FORWARD_PCT = 90;
+static const int MAX_FORWARD_PCT = 100;
 static const int MAX_TURN_PCT = 60;
-static const float TURN_KP = 90.0f; // proportional gain for turning, in % per radian of heading error
+static const float TURN_KP = 90.0f;
 static const float FORWARD_CUTOFF_RAD = radians(60.0f);
 static const float SLOWDOWN_RADIUS_M = 0.60f;
 static const int MIN_APPROACH_PCT = 60;
@@ -35,29 +37,29 @@ float heading_error_to(const Pose &pose, const Target &target) {
     return wrap_angle(heading_to_target - pose.theta);
 }
 
-bool has_arrived(const Pose &pose, const Target &target) {
-    return distance_to(pose, target) <= ARRIVAL_RADIUS_M;
+bool has_arrived(const Pose &pose, const Target &target, float radius_m) {
+    return distance_to(pose, target) <= radius_m;
 }
 
 bool find_nearest_weight(const Pose &pose, Target &target) {
   int robot_gx, robot_gy;
-  int least_dist = MAP_GRID_H*MAP_GRID_H + MAP_GRID_W*MAP_GRID_W + 1;
+  long least_dist = (long)MAP_GRID_H * MAP_GRID_H + (long)MAP_GRID_W * MAP_GRID_W + 1;
 
   world_to_grid(pose.x, pose.y, robot_gx, robot_gy);
-  
-  for(int i=0; i < MAP_GRID_W; i++) {
-    for(int j=0; j < MAP_GRID_H; j++) {
-        if(map_get_cell(i, j) == MAP_CELL_WEIGHT) {
-            int dist = (i - robot_gx)*(i - robot_gx) + (j - robot_gy)*(j - robot_gy);
-            if(dist < least_dist) {
-                grid_to_world(i, j, target.x, target.y);
-                least_dist = dist;
-            }
+
+  for (int i = 0; i < MAP_GRID_W; i++) {
+    for (int j = 0; j < MAP_GRID_H; j++) {
+      if (map_get_cell(i, j) == MAP_CELL_WEIGHT) {
+        long dist = (long)(i - robot_gx) * (i - robot_gx) + (long)(j - robot_gy) * (j - robot_gy);
+        if (dist < least_dist) {
+          grid_to_world(i, j, target.x, target.y);
+          least_dist = dist;
         }
+      }
     }
   }
 
-  return least_dist < MAP_GRID_H*MAP_GRID_H + MAP_GRID_W*MAP_GRID_W + 1;
+  return least_dist < (long)MAP_GRID_H * MAP_GRID_H + (long)MAP_GRID_W * MAP_GRID_W + 1;
 }
 
 void navigate_to_target(const Pose &pose, const Target &target, int &out_left_pct, int &out_right_pct) {
@@ -84,6 +86,4 @@ void navigate_to_target(const Pose &pose, const Target &target, int &out_left_pc
 
     out_left_pct = clamp_pct(forward_pct - turn_pct);
     out_right_pct = clamp_pct(forward_pct + turn_pct);
-
-
 }

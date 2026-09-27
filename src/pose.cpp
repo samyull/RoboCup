@@ -29,8 +29,6 @@ static const float FLOW_SIGN_LEFT = -1.0f;   // flip to -1 if left push gives ne
 static const float FLOW_OFFSET_FWD_M  = -0.2105f;
 static const float FLOW_OFFSET_LEFT_M = -0.13825f;
 
-#define LED_PIN 30
-CRGBArray<16> leds;
 
 // ---------------------------------------------------------------------------
 // State
@@ -60,6 +58,7 @@ static float wrap_angle(float angle_rad) {
 // ---------------------------------------------------------------------------
 // Init / reset (init sequence unchanged from the version that worked)
 // ---------------------------------------------------------------------------
+
 
 void pose_init(uint8_t flow_chip_select) {
   Wire.begin();
@@ -125,6 +124,12 @@ void pose_reset() {
     int16_t dx, dy;
     flow_sensor->readMotionCount(&dx, &dy);
   }
+}
+
+void pose_set_position(float x_m, float y_m) {
+  current_pose.x = x_m;
+  current_pose.y = y_m;
+  // theta is deliberately left untouched - see pose.h for why.
 }
 
 // ---------------------------------------------------------------------------

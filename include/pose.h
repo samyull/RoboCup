@@ -85,4 +85,6 @@ extern float FLOW_METERS_PER_COUNT;
  */
 void pose_print_debug();
 
+void pose_set_position(float x_m, float y_m);
+
 #endif // POSE_H
