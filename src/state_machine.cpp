@@ -3,11 +3,18 @@
 #include "grid_map.h"
 #include "tof_nav.h"
 #include "weight_collection.h"
+#include "path_planner.h"
+#include "exploration.h"
+#include "return_to_base.h"
 #include <Arduino.h>
 
+// Frontier exploration + path planning. false = the old waypoint sweep.
+static const bool USE_FRONTIER_NAV = true;
+
 // --- Tuning - all TODOs need checking/adjusting on real hardware ---
-static const uint32_t WEIGHT_LOST_TIMEOUT_MS = 2500;   // no fresh sighting -> scan (only if map is empty)
+static const uint32_t WEIGHT_LOST_TIMEOUT_MS = 2500;   // legacy: no fresh sighting -> scan
 static const int WEIGHTS_BEFORE_HOME = 3;
+static const uint32_t EARLY_HOME_MS = 90000;           // from 90 s, any weight on board -> home
 
 static const int   APPROACH_SPEED_PCT = 75;   // TODO: find the sweet spot on the bench
 static const float APPROACH_TURN_KP   = 40.0f; // gentler than general navigation - funnel forgives error
@@ -18,13 +25,36 @@ static const float ALIGN_TOLERANCE_RAD = radians(5.0f);
 static const int   VERIFY_TURN_PCT = 35;
 static const uint32_t VERIFY_ALIGN_TIMEOUT_MS = 2000;  // safety - don't spin forever trying to align exactly
 
-// SCANNING: stop-and-sample sweep. Coarse steps + short settle to keep this
-// cheap given the 2-minute round - see conversation notes on TOF timing.
+// APPROACH_BLIND: final approach once the target is confirmed and the path is clear.
+static const float    BLIND_START_DIST_M      = 1.0f;   // start within this of the target
+static const float    BLIND_CORRIDOR_HALF_W_M = 0.155f; // robot half-width incl. safety margin (310 mm corridor)
+static const float    BLIND_TOF_MARGIN_M      = 0.15f;  // top ToF reading this far short of target = blocked
+static const uint32_t BLIND_TIMEOUT_MS        = 5000;
+static const float    BLIND_CLOSE_DIST_M      = 0.20f;  // this close at the timeout: keep creeping in
+static const uint32_t BLIND_CLOSE_EXTRA_MS    = 3000;   // hard cap on that extra creep
+
+// Frontier exploration / path following
+static const uint32_t REPLAN_MS            = 500;
+static const float    FRONTIER_ARRIVE_M    = 0.15f;
+static const float    WEIGHT_HANDOVER_M    = 1.0f;    // GO_TO_WEIGHT -> APPROACH_VERIFY when this close + line of sight
+static const float    WEIGHT_MIN_PATH_M    = 0.05f;   // floor for confidence / path-length scoring
+static const uint32_t WEIGHT_SKIP_MS       = 10000;   // failed/unreachable weight cooldown
+static const float    WEIGHT_SKIP_RADIUS_M = 0.15f;
+static const uint32_t DROP_OFF_TIMEOUT_MS  = 3000;    // release should start well within this
+
+// Stuck: driving forward but not getting anywhere.
+static const uint32_t STUCK_WINDOW_MS  = 3000;
+static const float    STUCK_MIN_MOVE_M = 0.05f;
+static const uint32_t STUCK_REVERSE_MS = 500;
+static const int      STUCK_REVERSE_PCT = 60;
+
+// SCANNING. Frontier mode: one continuous turn (the ToF pose history keeps
+// mapping valid while turning). Legacy: stop-and-sample steps.
 static const float    SCAN_STEP_DEG = 15.0f;
 static const uint32_t SCAN_SETTLE_MS = 150;            // >= TOF timing budget (50ms) + margin
 static const int      SCAN_TURN_PCT = 35;
 
-// Lawnmower search pattern
+// Legacy lawnmower search pattern
 static const int MAX_WAYPOINTS = 24;
 static const float WAYPOINT_MARGIN_M = 0.2f;
 static const float WAYPOINT_STRIP_SPACING_M = 0.4f;    // TODO: tune to your TOF/flow effective sensing width
@@ -33,6 +63,7 @@ static const float WAYPOINT_STRIP_SPACING_M = 0.4f;    // TODO: tune to your TOF
 static StateMachine current_state = NAVIGATION;
 static Target locked_target;
 static uint32_t last_weight_seen_ms = 0;
+static uint32_t round_start_ms = 0;
 
 static Target waypoints[MAX_WAYPOINTS];
 static int waypoint_count = 0;
@@ -47,6 +78,50 @@ static const uint32_t VERIFY_SETTLE_MS = 150;
 static const uint32_t VERIFY_OBSERVE_TIMEOUT_MS = 1500;
 static const float VERIFY_SETTLE_RATE_RAD_S = 0.10f;
 
+static uint32_t blind_start_ms = 0;
+static uint32_t blind_start_pickups = 0;
+static uint32_t blind_start_clears = 0;
+static bool blind_holding_heading = false;  // within BLIND_CLOSE_DIST_M: drive straight
+static float blind_hold_theta = 0.0f;
+
+static uint32_t last_plan_ms = 0;
+static bool have_path = false;
+static uint32_t drop_off_start_ms = 0;
+
+static bool stuck_tracking = false;
+static float stuck_x = 0.0f, stuck_y = 0.0f;
+static uint32_t stuck_since_ms = 0;
+static uint32_t reverse_until_ms = 0;
+
+struct WeightSkip { float x, y; uint32_t until_ms; };
+static WeightSkip weight_skips[4];
+
+static int scan_step = 0;
+static int scan_step_count = 0;
+static float scan_start_theta = 0.0f;
+static bool scan_turning = true;
+static uint32_t scan_settle_start_ms = 0;
+static float scan_turned_rad = 0.0f;
+static float scan_prev_theta = 0.0f;
+
+static float wrap_angle(float angle_rad) {
+  while (angle_rad > PI)  angle_rad -= 2.0f * PI;
+  while (angle_rad < -PI) angle_rad += 2.0f * PI;
+  return angle_rad;
+}
+
+static void force_replan() {
+  last_plan_ms = millis() - REPLAN_MS;
+}
+
+// Back to searching: frontier exploration, or the legacy sweep.
+static void resume_search() {
+  current_state = USE_FRONTIER_NAV ? EXPLORE : NAVIGATION;
+  last_weight_seen_ms = millis();
+  have_path = false;
+  force_replan();
+}
+
 static void begin_verification(const Target &target) {
   locked_target = target;
   verify_start_ms = millis();
@@ -54,15 +129,21 @@ static void begin_verification(const Target &target) {
   current_state = APPROACH_VERIFY;
 }
 
+static void skip_weight(const Target &t) {
+  WeightSkip *slot = &weight_skips[0];
+  for (auto &s : weight_skips)
+    if ((int32_t)(s.until_ms - slot->until_ms) < 0) slot = &s;  // oldest / expired
+  *slot = {t.x, t.y, millis() + WEIGHT_SKIP_MS};
+}
 
-static int scan_step = 0;
-static int scan_step_count = 0;
-static float scan_start_theta = 0.0f;
-static bool scan_turning = true;
-static uint32_t scan_settle_start_ms = 0;
+static bool weight_skipped(float x, float y) {
+  const uint32_t now = millis();
+  for (const auto &s : weight_skips)
+    if ((int32_t)(s.until_ms - now) > 0 && hypotf(x - s.x, y - s.y) <= WEIGHT_SKIP_RADIUS_M) return true;
+  return false;
+}
 
-static void abandon_verification(const Pose &pose) {
-  // No reliable confirmation: search again without deleting map evidence.
+static void begin_legacy_scan(const Pose &pose) {
   scan_step = 0;
   scan_step_count = (int)(360.0f / SCAN_STEP_DEG);
   scan_start_theta = pose.theta;
@@ -70,10 +151,28 @@ static void abandon_verification(const Pose &pose) {
   current_state = SCANNING;
 }
 
-static float wrap_angle(float angle_rad) {
-  while (angle_rad > PI)  angle_rad -= 2.0f * PI;
-  while (angle_rad < -PI) angle_rad += 2.0f * PI;
-  return angle_rad;
+static void begin_continuous_scan(const Pose &pose) {
+  scan_turned_rad = 0.0f;
+  scan_prev_theta = pose.theta;
+  current_state = SCANNING;
+  Serial.println("No reachable frontier - scanning");
+}
+
+static void abandon_verification(const Pose &pose) {
+  // No reliable confirmation: search again without deleting map evidence.
+  if (USE_FRONTIER_NAV) {
+    skip_weight(locked_target);  // don't head straight back to the same spot
+    resume_search();
+  } else {
+    begin_legacy_scan(pose);
+  }
+}
+
+static void begin_return_home(const char *reason) {
+  Serial.print("Heading home: "); Serial.println(reason);
+  return_home_begin();
+  stuck_tracking = false;
+  current_state = RETURN_HOME;
 }
 
 // Overrides out_left_pct/out_right_pct if something is dangerously close,
@@ -84,6 +183,58 @@ static void apply_reflex(const TofReading ranges[TOF_TOTAL_COUNT], int &left_pct
     left_pct = rl;
     right_pct = rr;
   }
+}
+
+// True (and starts a short reverse) when driving forward has not moved the
+// robot STUCK_MIN_MOVE_M in STUCK_WINDOW_MS.
+static bool check_stuck(const Pose &pose, int left_pct, int right_pct) {
+  const uint32_t now = millis();
+  if (left_pct <= 0 || right_pct <= 0) {
+    stuck_tracking = false;
+    return false;
+  }
+  if (!stuck_tracking || hypotf(pose.x - stuck_x, pose.y - stuck_y) > STUCK_MIN_MOVE_M) {
+    stuck_tracking = true;
+    stuck_x = pose.x;
+    stuck_y = pose.y;
+    stuck_since_ms = now;
+    return false;
+  }
+  if (now - stuck_since_ms < STUCK_WINDOW_MS) return false;
+  stuck_tracking = false;
+  reverse_until_ms = now + STUCK_REVERSE_MS;
+  Serial.println("Stuck - reversing and replanning");
+  return true;
+}
+
+// Best reachable mapped weight by confidence / path length (call planner_plan first).
+static bool choose_weight(Target &out) {
+  float best_score = -1.0f;
+  for (int gy = 0; gy < MAP_GRID_H; ++gy)
+    for (int gx = 0; gx < MAP_GRID_W; ++gx) {
+      if (map_get_cell(gx, gy) != MAP_CELL_WEIGHT) continue;
+      if (planner_cost(gx, gy) == PLAN_UNREACHABLE) continue;
+      float x, y;
+      grid_to_world(gx, gy, x, y);
+      if (weight_skipped(x, y)) continue;
+      const float path_m = max(planner_distance_m(gx, gy), WEIGHT_MIN_PATH_M);
+      const float score = map_get_confidence(gx, gy) / path_m;
+      if (score > best_score) {
+        best_score = score;
+        out = {x, y};
+      }
+    }
+  return best_score >= 0.0f;
+}
+
+static void go_to_weight(const Target &weight) {
+  locked_target = weight;
+  current_state = GO_TO_WEIGHT;
+  stuck_tracking = false;
+  have_path = false;
+  force_replan();
+  Serial.print("Going to weight at "); Serial.print(weight.x, 2);
+  Serial.print(","); Serial.println(weight.y, 2);
 }
 
 // Simple back-and-forth sweep across the arena, used as the default search
@@ -113,13 +264,136 @@ static void build_waypoints() {
 void state_machine_init() {
   build_waypoints();
   waypoint_index = 0;
-  current_state = NAVIGATION;
-  last_weight_seen_ms = millis();
+  round_start_ms = millis();
+  for (auto &s : weight_skips) s = {0.0f, 0.0f, round_start_ms};
+  stuck_tracking = false;
+  reverse_until_ms = round_start_ms;
+  planner_clear_path();
+  resume_search();
 }
 
 StateMachine state_machine_current_state() {
   return current_state;
 }
+
+const char *state_machine_state_name() {
+  switch (current_state) {
+    case NAVIGATION:      return "NAVIGATION";
+    case APPROACH_VERIFY: return "APPROACH_VERIFY";
+    case APPROACH_WEIGHT: return "APPROACH_WEIGHT";
+    case SCANNING:        return "SCANNING";
+    case RETURN_HOME:     return "RETURN_HOME";
+    case DROP_OFF:        return "DROP_OFF";
+    case APPROACH_BLIND:  return "APPROACH_BLIND";
+    case EXPLORE:         return "EXPLORE";
+    case GO_TO_WEIGHT:    return "GO_TO_WEIGHT";
+  }
+  return "?";
+}
+
+bool state_machine_front_blind() {
+  return current_state == APPROACH_BLIND;
+}
+
+// --- Frontier exploration ---
+
+static void run_explore(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
+                        int &left_pct, int &right_pct) {
+  left_pct = right_pct = 0;
+  const uint32_t now = millis();
+  if (now - last_plan_ms >= REPLAN_MS) {
+    last_plan_ms = now;
+    planner_plan(pose, PLAN_ALLOW_UNSEEN);
+    Target weight;
+    if (choose_weight(weight)) {
+      go_to_weight(weight);
+      return;
+    }
+    FrontierGoal goal;
+    if (!exploration_choose_frontier(pose, goal)) {
+      begin_continuous_scan(pose);
+      return;
+    }
+    have_path = planner_set_goal(goal.gx, goal.gy);
+  }
+  if (!have_path) return;
+  if (planner_follow(pose, FRONTIER_ARRIVE_M, left_pct, right_pct)) force_replan();  // reached: next goal
+  apply_reflex(ranges, left_pct, right_pct);
+  if (check_stuck(pose, left_pct, right_pct)) {
+    exploration_skip_current_goal();
+    force_replan();
+  }
+}
+
+static void run_go_to_weight(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
+                             int &left_pct, int &right_pct) {
+  left_pct = right_pct = 0;
+  int gx, gy;
+  if (!world_to_grid(locked_target.x, locked_target.y, gx, gy) || map_get_cell(gx, gy) != MAP_CELL_WEIGHT) {
+    resume_search();  // decayed, disproved, or collected by someone else
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - last_plan_ms >= REPLAN_MS) {
+    last_plan_ms = now;
+    planner_plan(pose, PLAN_ALLOW_UNSEEN);
+    have_path = planner_set_goal(gx, gy);
+    if (!have_path) {
+      skip_weight(locked_target);
+      resume_search();
+      return;
+    }
+  }
+  // Close with a clear straight line: turn to face it and confirm before approaching.
+  if (distance_to(pose, locked_target) <= WEIGHT_HANDOVER_M &&
+      planner_straight_clear(pose.x, pose.y, locked_target.x, locked_target.y)) {
+    planner_clear_path();
+    begin_verification(locked_target);
+    return;
+  }
+  if (!have_path) return;
+  planner_follow(pose, 0.0f, left_pct, right_pct);
+  apply_reflex(ranges, left_pct, right_pct);
+  if (check_stuck(pose, left_pct, right_pct)) {
+    skip_weight(locked_target);
+    resume_search();
+  }
+}
+
+static void run_scan_continuous(const Pose &pose, int &left_pct, int &right_pct) {
+  left_pct = right_pct = 0;
+  scan_turned_rad += fabsf(wrap_angle(pose.theta - scan_prev_theta));
+  scan_prev_theta = pose.theta;
+  const uint32_t now = millis();
+
+  if (now - last_plan_ms >= REPLAN_MS) {
+    // A weight spotted mid-scan takes priority.
+    last_plan_ms = now;
+    planner_plan(pose, PLAN_ALLOW_UNSEEN);
+    Target weight;
+    if (choose_weight(weight)) {
+      go_to_weight(weight);
+      return;
+    }
+  }
+  if (scan_turned_rad >= 2.0f * PI) {
+    planner_plan(pose, PLAN_ALLOW_UNSEEN);
+    FrontierGoal goal;
+    if (exploration_choose_frontier(pose, goal)) {
+      resume_search();
+    } else if (weight_collection_count() > 0) {
+      begin_return_home("nothing left to explore");
+    } else {
+      exploration_reset();  // everything seen and nothing found: go round again
+      resume_search();
+    }
+    return;
+  }
+  left_pct = -SCAN_TURN_PCT;
+  right_pct = SCAN_TURN_PCT;
+}
+
+// --- Legacy waypoint sweep ---
 
 static void run_navigation(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
                             int &left_pct, int &right_pct) {
@@ -131,11 +405,7 @@ static void run_navigation(const Pose &pose, const TofReading ranges[TOF_TOTAL_C
   }
 
   if (millis() - last_weight_seen_ms >= WEIGHT_LOST_TIMEOUT_MS) {
-    scan_step = 0;
-    scan_step_count = (int)(360.0f / SCAN_STEP_DEG);
-    scan_start_theta = pose.theta;
-    scan_turning = true;
-    current_state = SCANNING;
+    begin_legacy_scan(pose);
     left_pct = right_pct = 0;
     return;
   }
@@ -146,6 +416,43 @@ static void run_navigation(const Pose &pose, const TofReading ranges[TOF_TOTAL_C
   navigate_to_target(pose, waypoints[waypoint_index], left_pct, right_pct);
   apply_reflex(ranges, left_pct, right_pct);
 }
+
+static void run_legacy_scan(const Pose &pose, int &left_pct, int &right_pct) {
+  if (scan_turning) {
+    float target_theta = wrap_angle(scan_start_theta + radians(SCAN_STEP_DEG) * scan_step);
+    float err = wrap_angle(target_theta - pose.theta);
+
+    if (fabsf(err) <= ALIGN_TOLERANCE_RAD) {
+      scan_turning = false;
+      scan_settle_start_ms = millis();
+      left_pct = right_pct = 0;
+    } else {
+      int turn = err > 0 ? SCAN_TURN_PCT : -SCAN_TURN_PCT;
+      left_pct = -turn;
+      right_pct = turn;
+    }
+    return;
+  }
+
+  left_pct = right_pct = 0;   // hold still while the TOFs settle and get read
+
+  if (millis() - scan_settle_start_ms < SCAN_SETTLE_MS) return;
+
+  scan_step++;
+  if (scan_step >= scan_step_count) {
+    // Full sweep done.
+    Target found;
+    if (find_nearest_weight(pose, found)) {
+      begin_verification(found);
+    } else {
+      resume_search();   // also stops an immediate re-trigger of another scan
+    }
+  } else {
+    scan_turning = true;
+  }
+}
+
+// --- Approach ---
 
 static void run_approach_verify(const Pose &pose, int &left_pct, int &right_pct) {
   left_pct = right_pct = 0;
@@ -205,103 +512,171 @@ static void run_approach_verify(const Pose &pose, int &left_pct, int &right_pct)
   if (now - verify_phase_ms >= VERIFY_OBSERVE_TIMEOUT_MS) abandon_verification(pose);
 }
 
+// Drive forward at approach speed, steering to cancel heading_err.
+static void approach_drive(float heading_err, int &left_pct, int &right_pct) {
+  int turn = (int)(APPROACH_TURN_KP * heading_err);
+  if (turn > MAX_APPROACH_TURN_PCT) turn = MAX_APPROACH_TURN_PCT;
+  if (turn < -MAX_APPROACH_TURN_PCT) turn = -MAX_APPROACH_TURN_PCT;
+
+  left_pct = APPROACH_SPEED_PCT - turn;
+  right_pct = APPROACH_SPEED_PCT + turn;
+}
+
+// Map cells a blind approach must not drive through.
+static bool cell_blocks_path(int gx, int gy) {
+  const int8_t cell = map_get_cell(gx, gy);
+  return cell == MAP_CELL_OBSTACLE || cell == MAP_CELL_BORDER;
+}
+
+// Target within BLIND_START_DIST_M, no mapped walls in a robot-width corridor
+// up to it, and neither front top ToF seeing anything well short of it.
+static bool blind_path_clear(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT]) {
+  const float dist = distance_to(pose, locked_target);
+  if (dist > BLIND_START_DIST_M) return false;
+  if (!tof_front_clear_to(ranges, dist, BLIND_TOF_MARGIN_M)) return false;
+  if (dist < 1e-3f) return true;
+
+  const float ux = (locked_target.x - pose.x) / dist;
+  const float uy = (locked_target.y - pose.y) / dist;
+  const float step = 0.5f * MAP_CELL_SIZE_M;
+  // Stop a cell short of the target: the weight itself may sit against a wall.
+  for (float d = 0.0f; d < dist - MAP_CELL_SIZE_M; d += step) {
+    for (float w = -BLIND_CORRIDOR_HALF_W_M; w <= BLIND_CORRIDOR_HALF_W_M + 1e-3f; w += step) {
+      int gx, gy;
+      if (world_to_grid(pose.x + ux * d - uy * w, pose.y + uy * d + ux * w, gx, gy) &&
+          cell_blocks_path(gx, gy)) return false;
+    }
+  }
+  return true;
+}
+
+static void begin_blind(const Pose &pose) {
+  blind_start_ms = millis();
+  blind_start_pickups = weight_collection_total_pickups();
+  blind_start_clears = weight_collection_total_clears();
+  blind_holding_heading = false;
+  current_state = APPROACH_BLIND;
+  Serial.print("Blind approach: target "); Serial.print(distance_to(pose, locked_target), 2);
+  Serial.println(" m ahead, front ToFs ignored");
+}
+
+static void end_blind_and_reverify(const char *reason) {
+  Serial.print("Blind approach ended ("); Serial.print(reason);
+  Serial.println(") - looking at the target again");
+  begin_verification(locked_target);
+}
+
 static void run_approach_weight(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
                                  int &left_pct, int &right_pct) {
   int target_gx, target_gy;
   if (!world_to_grid(locked_target.x, locked_target.y, target_gx, target_gy) ||
       map_get_cell(target_gx, target_gy) != MAP_CELL_WEIGHT) {
     // Confidence decayed or new observations made this target uncollectable.
-    current_state = NAVIGATION;
+    resume_search();
     left_pct = right_pct = 0;
+    return;
+  }
+  if (blind_path_clear(pose, ranges)) {
+    begin_blind(pose);
+    approach_drive(heading_error_to(pose, locked_target), left_pct, right_pct);
     return;
   }
   // Fallback only - real "arrival" is the catchment sensors firing, handled
   // entirely outside this state machine via weight_collection_busy().
   if (has_arrived(pose, locked_target, WEIGHT_ARRIVAL_RADIUS_M)) {
-    current_state = NAVIGATION;
+    resume_search();
     left_pct = right_pct = 0;
     return;
   }
 
-  float err = heading_error_to(pose, locked_target);
-  int turn = (int)(APPROACH_TURN_KP * err);
-  if (turn > MAX_APPROACH_TURN_PCT) turn = MAX_APPROACH_TURN_PCT;
-  if (turn < -MAX_APPROACH_TURN_PCT) turn = -MAX_APPROACH_TURN_PCT;
-
-  left_pct = APPROACH_SPEED_PCT - turn;
-  right_pct = APPROACH_SPEED_PCT + turn;
-
+  approach_drive(heading_error_to(pose, locked_target), left_pct, right_pct);
   apply_reflex(ranges, left_pct, right_pct);
 }
 
-void run_scanning(const Pose &pose, int &left_pct, int &right_pct) {
-  if (scan_turning) {
-    float target_theta = wrap_angle(scan_start_theta + radians(SCAN_STEP_DEG) * scan_step);
-    float err = wrap_angle(target_theta - pose.theta);
+// Steers on pose alone: no map check on the target, no reflex, no front ToFs.
+// Feeding, pickup and the clearing arm run outside the state machine (it is
+// not called while collection is busy); their outcome is checked on return.
+static void run_approach_blind(const Pose &pose, int &left_pct, int &right_pct) {
+  left_pct = right_pct = 0;
 
-    if (fabsf(err) <= ALIGN_TOLERANCE_RAD) {
-      scan_turning = false;
-      scan_settle_start_ms = millis();
-      left_pct = right_pct = 0;
-    } else {
-      int turn = err > 0 ? SCAN_TURN_PCT : -SCAN_TURN_PCT;
-      left_pct = -turn;
-      right_pct = turn;
-    }
+  if (weight_collection_total_pickups() != blind_start_pickups) {
+    // Collected: the target cell is now empty, so retire it from the map.
+    int gx, gy;
+    if (world_to_grid(locked_target.x, locked_target.y, gx, gy)) map_reject_weight(gx, gy);
+    Serial.println("Blind approach ended (weight collected)");
+    resume_search();
+    return;
+  }
+  if (weight_collection_total_clears() != blind_start_clears) {
+    // Fed for the full timeout without induction and swept it away: check for a wall.
+    end_blind_and_reverify("clearing arm swept the funnel");
     return;
   }
 
-  left_pct = right_pct = 0;   // hold still while the TOFs settle and get read
-
-  if (millis() - scan_settle_start_ms < SCAN_SETTLE_MS) return;
-
-  scan_step++;
-  if (scan_step >= scan_step_count) {
-    // Full sweep done.
-    Target found;
-    if (find_nearest_weight(pose, found)) {
-      begin_verification(found);
-    } else {
-      last_weight_seen_ms = millis();   // don't immediately re-trigger another scan
-      current_state = NAVIGATION;
-    }
-  } else {
-    scan_turning = true;
+  const uint32_t elapsed = millis() - blind_start_ms;
+  const float dist = distance_to(pose, locked_target);
+  if (elapsed >= BLIND_TIMEOUT_MS &&
+      (dist > BLIND_CLOSE_DIST_M || elapsed >= BLIND_TIMEOUT_MS + BLIND_CLOSE_EXTRA_MS)) {
+    end_blind_and_reverify("timeout");
+    return;
   }
+
+  // Close in, steering at the target point gets unstable (and flips once
+  // passed), so hold the heading we had on reaching the close zone.
+  if (dist <= BLIND_CLOSE_DIST_M && !blind_holding_heading) {
+    blind_holding_heading = true;
+    blind_hold_theta = pose.theta;
+  }
+  const float err = blind_holding_heading ? wrap_angle(blind_hold_theta - pose.theta)
+                                          : heading_error_to(pose, locked_target);
+  approach_drive(err, left_pct, right_pct);
 }
+
+// --- Home ---
 
 static void run_return_home(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
                              int &left_pct, int &right_pct) {
-  Target home = {0.0f, 0.0f};
-
-  if (has_arrived(pose, home)) {
-    pose_set_position(0.0f, 0.0f);   // correct drift now we know exactly where we are
+  if (return_home_update(pose, left_pct, right_pct)) {
     weight_collection_request_release();
+    drop_off_start_ms = millis();
     current_state = DROP_OFF;
     left_pct = right_pct = 0;
     return;
   }
-
-  navigate_to_target(pose, home, left_pct, right_pct);
   apply_reflex(ranges, left_pct, right_pct);
+  check_stuck(pose, left_pct, right_pct);  // reverse, then the 2 Hz replan finds a way round
 }
 
 void state_machine_update(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT], bool weight_seen_this_frame, int &out_left_pct, int &out_right_pct) {
-
+  const uint32_t now = millis();
   if (weight_seen_this_frame) {
-    last_weight_seen_ms = millis();
+    last_weight_seen_ms = now;
   }
 
-  // 3 collected -> head home, overriding whatever else was happening.
-  if (current_state != RETURN_HOME && current_state != DROP_OFF &&
-      weight_collection_count() >= WEIGHTS_BEFORE_HOME) {
-    current_state = RETURN_HOME;
+  // Head home when full, or from 90 s in with anything on board.
+  if (current_state != RETURN_HOME && current_state != DROP_OFF) {
+    const int on_board = weight_collection_count();
+    if (on_board >= WEIGHTS_BEFORE_HOME) begin_return_home("full");
+    else if (on_board > 0 && now - round_start_ms >= EARLY_HOME_MS) begin_return_home("90 s with a weight on board");
   }
 
   out_left_pct = 0;
   out_right_pct = 0;
 
+  // Backing off after getting stuck (path-following states only).
+  if ((int32_t)(reverse_until_ms - now) > 0 &&
+      (current_state == EXPLORE || current_state == GO_TO_WEIGHT || current_state == RETURN_HOME)) {
+    out_left_pct = out_right_pct = -STUCK_REVERSE_PCT;
+    return;
+  }
+
   switch (current_state) {
+    case EXPLORE:
+      run_explore(pose, ranges, out_left_pct, out_right_pct);
+      break;
+    case GO_TO_WEIGHT:
+      run_go_to_weight(pose, ranges, out_left_pct, out_right_pct);
+      break;
     case NAVIGATION:
       run_navigation(pose, ranges, out_left_pct, out_right_pct);
       break;
@@ -311,18 +686,22 @@ void state_machine_update(const Pose &pose, const TofReading ranges[TOF_TOTAL_CO
     case APPROACH_WEIGHT:
       run_approach_weight(pose, ranges, out_left_pct, out_right_pct);
       break;
+    case APPROACH_BLIND:
+      run_approach_blind(pose, out_left_pct, out_right_pct);
+      break;
     case SCANNING:
-      run_scanning(pose, out_left_pct, out_right_pct);
+      if (USE_FRONTIER_NAV) run_scan_continuous(pose, out_left_pct, out_right_pct);
+      else                  run_legacy_scan(pose, out_left_pct, out_right_pct);
       break;
     case RETURN_HOME:
       run_return_home(pose, ranges, out_left_pct, out_right_pct);
       break;
     case DROP_OFF:
-      // Only reached again once weight_collection's release swing has
-      // actually completed (see main.cpp's busy-gating) - colour sensing /
-      // real deposit logic goes here later. For now, just resume searching.
-      current_state = NAVIGATION;
-      last_weight_seen_ms = millis();
+      // Only reached again once the release swing has finished (the state machine
+      // is not called while collection is busy) - or if it never managed to start.
+      if (weight_collection_count() == 0 || now - drop_off_start_ms >= DROP_OFF_TIMEOUT_MS) {
+        resume_search();
+      }
       break;
   }
 }

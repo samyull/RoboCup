@@ -8,7 +8,4 @@ void electromagnets_on();
 void electromagnets_off();
 bool electromagnets_are_on();
 
-// On for 2s, off for 2s (blocking, for testing).
-void electromagnets_test();
-
 #endif

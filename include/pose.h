@@ -36,17 +36,23 @@ void pose_init(uint8_t flow_chip_select);
  * (dt) is needed - but the counts are stored in an int16, so don't let
  * the gap between calls get very long.
  *
- * @return the updated Pose (also available via pose_get())
+ * @return the updated Pose
  */
 Pose pose_update();
 
-// Reacquire heading and discard flow accumulated while collection held driving stopped.
-void pose_resume_after_collection();
+// The current estimate without taking a new reading (e.g. after a correction).
+Pose pose_current();
 
 /**
- * @return the most recently computed pose without taking a new reading.
+ * Pose at time t_ms (millis), interpolated from the last ~1 s of pose_update()
+ * results. A time after the newest sample returns the newest. Returns false
+ * (out untouched) if there is no history or t_ms is older than it covers.
+ * History is cleared by pose_reset(), pose_set_position() and pose_set_heading().
  */
-Pose pose_get();
+bool pose_at(uint32_t t_ms, Pose &out);
+
+// Reacquire heading and discard flow accumulated while collection held driving stopped.
+void pose_resume_after_collection();
 
 /**
  * Reset x, y, theta back to zero, re-zero the heading to the current
@@ -87,14 +93,18 @@ bool pose_flow_ready();
  */
 extern float FLOW_METERS_PER_COUNT;
 
-/**
- * Print raw sensor readings (BNO055 heading, PMW3901 raw counts) plus the
- * current integrated pose to Serial. Useful for confirming the sensors are
- * actually producing data before trusting the integrated x/y/theta.
- */
-void pose_print_debug();
+// BNO055 calibration levels, 0 (uncalibrated) to 3 (fully calibrated). All 0 if the IMU is not ready.
+void pose_get_calibration(uint8_t &sys, uint8_t &gyro, uint8_t &accel, uint8_t &mag);
 
 void pose_set_position(float x_m, float y_m);
+
+// Shift x/y by a small correction (wall re-anchoring). Pose history is shifted
+// too, so readings keep being placed consistently.
+void pose_nudge_position(float dx_m, float dy_m);
+
+// Make the current IMU heading read as theta_rad (e.g. the start layout's
+// heading); later readings follow on from it.
+void pose_set_heading(float theta_rad);
 
 float angular_speed_rad_s();
 

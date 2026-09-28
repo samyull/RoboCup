@@ -1,13 +1,37 @@
-// arena_config.h - new small header
 #ifndef ARENA_CONFIG_H
 #define ARENA_CONFIG_H
 
-// Measured physically: how far the robot's centre of rotation sits from
-// the two walls forming its starting corner, along whichever directions
-// become +x (forward) and +y (left) at boot. Re-anchors pose's local
-// (0,0) to the arena's TRUE corner, not wherever the robot is parked
-// within the 600x600mm base.
-#define ROBOT_START_X_M 0.3f   // TODO: measure on the day
-#define ROBOT_START_Y_M 0.3f   // TODO: measure on the day
+// ---------------------------------------------------------------------------
+// STARTING LAYOUT - set before every round.
+// Leave exactly ONE block below uncommented.
+//
+// Arena frame: x along the long wall (0 to 4.9 m), y along the short wall
+// (0 to 2.4 m), heading measured anticlockwise from +x. Both start corners are
+// at the x = 0 short end. Standing at that end looking down the arena, the
+// BLUE corner is on the right (the origin) and the GREEN corner on the left.
+//
+// X/Y: where the robot's centre of rotation sits at the button press - measure
+// on the day. Heading: the direction the robot faces at the press.
+// ---------------------------------------------------------------------------
+
+// BLUE corner, facing along the long wall
+#define ROBOT_START_X_M         0.3f
+#define ROBOT_START_Y_M         0.3f
+#define ROBOT_START_HEADING_DEG 0.0f
+
+// BLUE corner, facing along the short wall (towards green)
+// #define ROBOT_START_X_M         0.3f
+// #define ROBOT_START_Y_M         0.3f
+// #define ROBOT_START_HEADING_DEG 90.0f
+
+// GREEN corner, facing along the long wall
+// #define ROBOT_START_X_M         0.3f
+// #define ROBOT_START_Y_M         2.1f
+// #define ROBOT_START_HEADING_DEG 0.0f
+
+// GREEN corner, facing along the short wall (towards blue)
+// #define ROBOT_START_X_M         0.3f
+// #define ROBOT_START_Y_M         2.1f
+// #define ROBOT_START_HEADING_DEG -90.0f
 
 #endif

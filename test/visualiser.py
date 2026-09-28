@@ -7,19 +7,15 @@ Run: python visualiser.py COM5
 
 Sends R once per launch by default (bench testing: resets robot state).
 Reconnects to the same port after USB reset, without sending R again.
-Firmware must call check_serial_commands() at the start of loop().
-For startup-only map updates, firmware must wait for the serial client
-before map_init(), or provide a full-map resend command. Python cannot
-recover updates sent while USB was disconnected.
+On every other connect it sends M, and the robot resends its whole map.
 """
 
 import argparse
-import re
 import time
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap, Normalize
 from matplotlib.patches import Patch
 import numpy as np
 import serial
@@ -37,15 +33,21 @@ BAUD_RATE = 115200
 
 CELL_BORDER, CELL_UNKNOWN, CELL_FREE = -2, -1, 0
 CELL_OBSTACLE, CELL_ROBOT, CELL_WEIGHT = 1, 2, 3
-CELL_VALUES = [-2, -1, 0, 1, 2, 3]
-CELL_COLORS = ["black", "grey", "grey", "red", "grey", "gold"]
-STATE_NAMES = ["NAVIGATION", "APPROACH_VERIFY", "APPROACH_WEIGHT",
-               "SCANNING", "RETURN_HOME", "DROP_OFF"]
-NUMBER = r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
-POSE_DEBUG_RE = re.compile(
-    r"\bx=\s*" + NUMBER + r"\s+y=\s*" + NUMBER + r"\s+theta_deg=\s*" + NUMBER
-)
-SERIAL_ERRORS = (serial.SerialException, OSError)
+# Cells are coloured by confidence: grey at 0, shading to solid red (wall) at
+# -MAP_ENTER_SCORE and solid gold (weight) at +MAP_ENTER_SCORE, and staying
+# solid beyond. Border cells (score -101) are drawn black.
+MAP_ENTER_SCORE = 20  # must match grid_map.h
+CONFIDENCE_CMAP = LinearSegmentedColormap.from_list(
+    "confidence", ["red", "grey", "gold"]).with_extremes(under="black")
+# Coarse exploration grid (exploration.h): 4x4 map cells over the arena interior.
+EXPLORE_FINE_PER_CELL = 4
+EXPLORE_W = (GRID_W - 2 + EXPLORE_FINE_PER_CELL - 1) // EXPLORE_FINE_PER_CELL
+EXPLORE_H = (GRID_H - 2 + EXPLORE_FINE_PER_CELL - 1) // EXPLORE_FINE_PER_CELL
+UNEXPLORED_SHADE = (0.0, 0.0, 0.0, 0.35)  # translucent dark over unexplored ground
+PATH_COLOR = "#FF8C00"
+HEADING_ARROW_M = 0.2  # length of the heading arrow drawn on the pose dot
+POSE_COLOR = "#39FF14"  # bright green, stands out on the grey grid
+SERIAL_ERRORS =(serial.SerialException, OSError)
 
 
 def grid_to_world(gx, gy):
@@ -69,34 +71,54 @@ class Visualiser:
         self.anim = None
         self.grid = np.full((GRID_H, GRID_W), CELL_UNKNOWN, dtype=int)
         self.scores = np.zeros((GRID_H, GRID_W), dtype=int)
+        self.explored = np.zeros((EXPLORE_H, EXPLORE_W), dtype=bool)
         self._clear_state()
 
         self.fig, self.ax = plt.subplots(figsize=(12, 7))
         self.fig.subplots_adjust(bottom=0.18)
-        cmap = ListedColormap(CELL_COLORS)
-        norm = BoundaryNorm(np.arange(-2.5, 4.0, 1.0), cmap.N)
         # Firmware coordinates name cell centres.
         x_edges = (np.arange(GRID_W + 1) - X_ZERO - 0.5) * CELL_SIZE_M
         y_edges = (np.arange(GRID_H + 1) - Y_ZERO - 0.5) * CELL_SIZE_M
         self.mesh = self.ax.pcolormesh(
-            x_edges, y_edges, self.grid, cmap=cmap, norm=norm,
+            x_edges, y_edges, self._display_scores(), cmap=CONFIDENCE_CMAP,
+            norm=Normalize(vmin=-MAP_ENTER_SCORE, vmax=MAP_ENTER_SCORE),
             edgecolors="black", linewidth=0.4, shading="flat",
         )
+        colorbar = self.fig.colorbar(self.mesh, ax=self.ax, fraction=0.025, pad=0.02)
+        colorbar.set_label("confidence (border = black)")
+        colorbar.set_ticks([-MAP_ENTER_SCORE, 0, MAP_ENTER_SCORE])
+        colorbar.set_ticklabels([f"<=-{MAP_ENTER_SCORE}\nwall", "0\nfree",
+                                 f">={MAP_ENTER_SCORE}\nweight"])
+        # Exploration overlay: coarse cells, dark until explored. Edges follow the
+        # map cells each coarse cell covers.
+        cx_edges = [(1 + cx * EXPLORE_FINE_PER_CELL - X_ZERO - 0.5) * CELL_SIZE_M
+                    for cx in range(EXPLORE_W)] + [(GRID_W - 2 - X_ZERO + 0.5) * CELL_SIZE_M]
+        cy_edges = [(1 + cy * EXPLORE_FINE_PER_CELL - Y_ZERO - 0.5) * CELL_SIZE_M
+                    for cy in range(EXPLORE_H)] + [(GRID_H - 2 - Y_ZERO + 0.5) * CELL_SIZE_M]
+        self.explore_mesh = self.ax.pcolormesh(
+            cx_edges, cy_edges, self._unexplored(), shading="flat", zorder=2,
+            cmap=ListedColormap([(0.0, 0.0, 0.0, 0.0), UNEXPLORED_SHADE]),
+            norm=Normalize(vmin=0, vmax=1),
+        )
+        self.path_line, = self.ax.plot([], [], "-", color=PATH_COLOR, linewidth=1.5,
+                                       label="planned path", zorder=3)
         self.ax.set_aspect("equal")
         self.ax.set_xlabel("x (m)")
         self.ax.set_ylabel("y (m)")
-        self.ax.set_title("Grid classifications")
-        self.pose_dot, = self.ax.plot([], [], "o", color="#145A14",
-                                      markersize=4, label="pose")
-        self.target_dot, = self.ax.plot([], [], "o", color="#FF8C00",
-                                        markersize=10, label="target")
-        self.ax.legend(handles=[
-            Patch(facecolor="black", label="border"),
-            Patch(facecolor="grey", label="free / unconfirmed"),
-            Patch(facecolor="red", label="wall"),
-            Patch(facecolor="gold", label="weight"),
-            self.pose_dot, self.target_dot,
-        ], loc="upper right")
+        self.ax.set_title("Grid confidence")
+        self.pose_dot, = self.ax.plot([], [], "o", color=POSE_COLOR, markeredgecolor="black",
+                                      markersize=7, label="pose", zorder=4)
+        # Heading arrow from the pose dot, fixed length in metres.
+        self.heading_arrow = self.ax.quiver(
+            [0.0], [0.0], [0.0], [0.0], color=POSE_COLOR, edgecolor="black", linewidth=0.5,
+            angles="xy", scale_units="xy", scale=1, width=0.005, zorder=3,
+        )
+        self.heading_arrow.set_visible(False)
+        self.target_dot, = self.ax.plot([], [], "o", color=PATH_COLOR,
+                                        markersize=10, label="goal", zorder=4)
+        self.ax.legend(handles=[self.pose_dot, self.target_dot, self.path_line,
+                                Patch(facecolor=UNEXPLORED_SHADE, label="unexplored")],
+                       loc="upper right")
         self.info_text = self.ax.text(
             0.02, 0.98, "", transform=self.ax.transAxes, va="top",
             fontsize=9, family="monospace",
@@ -105,15 +127,24 @@ class Visualiser:
         self.connection_text = self.fig.text(0.08, 0.025, "", fontsize=9)
         self.fig.canvas.mpl_connect("close_event", self.close)
 
+    def _display_scores(self):
+        # Clamp to the threshold so confirmed cells are solid; borders stay below range (black).
+        clipped = np.clip(self.scores, -MAP_ENTER_SCORE, MAP_ENTER_SCORE)
+        return np.where(self.scores == -101, -101, clipped)
+
+    def _unexplored(self):
+        return (~self.explored).astype(float)
+
     def _clear_state(self):
+        self.explored.fill(False)
+        self.path = None
         self.grid.fill(CELL_FREE)
         self.scores.fill(0)
         self.scores[0, :] = self.scores[-1, :] = -101
         self.scores[:, 0] = self.scores[:, -1] = -101
         self.grid[0, :] = self.grid[-1, :] = CELL_BORDER
         self.grid[:, 0] = self.grid[:, -1] = CELL_BORDER
-        self.pose = self.target = self.motors = self.state_info = None
-        self.diag = None
+        self.pose = self.target = self.tel = self.tofs = None
         self.cell_updates = self.telemetry_count = self.bad_lines = 0
 
     def _close_port(self):
@@ -160,6 +191,12 @@ class Visualiser:
                     raise serial.SerialException("Restart byte was not written")
                 # No flush is needed here; subsequent read errors also trigger
                 # reconnection if the board resets immediately after write.
+            else:
+                # Cells are only sent when they change, so ask for the whole
+                # current map rather than showing just what changes from now.
+                self._clear_state()
+                if self.ser.write(b"M") != 1:
+                    raise serial.SerialException("Map request byte was not written")
             return True
         except SERIAL_ERRORS as exc:
             self._disconnect(exc)
@@ -171,9 +208,12 @@ class Visualiser:
             return
         if self.debug:
             print(line, flush=True)
-        if line == "=== BOOT ===":
-            self._clear_state()
+        if line == "=== BOOT ===" or line.startswith("=== ROUND START"):
+            self._clear_state()  # fresh map and exploration either way
             self.last_message = line
+            return
+        if line == "V_RESET":
+            self.explored.fill(False)
             return
         parts = line.split(",")
         tag = parts[0]
@@ -187,38 +227,39 @@ class Visualiser:
                 self.scores[gy, gx] = score
                 self.grid[gy, gx] = label
                 self.cell_updates += 1
-            elif tag == "C" and len(parts) == 4:
-                gx, gy, value = map(int, parts[1:])
-                if not (0 <= gx < GRID_W and 0 <= gy < GRID_H
-                        and value in CELL_VALUES):
-                    raise ValueError("invalid cell")
-                self.grid[gy, gx] = value
-                self.scores[gy, gx] = {CELL_BORDER: -101, CELL_OBSTACLE: -100, CELL_WEIGHT: 100}.get(value, 0)
-                self.cell_updates += 1
-            elif tag in ("P", "T") and len(parts) == (4 if tag == "P" else 3):
+            elif tag == "TEL":
+                tel = dict(part.split("=", 1) for part in parts[1:])
+                pose = tuple(float(tel[k]) for k in ("x", "y", "th"))
+                if not all(np.isfinite(pose)):
+                    raise ValueError("non-finite coordinates")
+                self.pose = (pose[0], pose[1], np.radians(pose[2]))
+                self.tel = tel
+            elif tag == "TOF":
+                # Labelled mm readings in firmware order, e.g. LST=812, "-" = none.
+                tofs = [tuple(part.split("=", 1)) for part in parts[1:]]
+                if not tofs or not all(len(t) == 2 for t in tofs):
+                    raise ValueError("invalid ToF field")
+                self.tofs = tofs
+            elif tag == "V" and len(parts) == 3:
+                cx, cy = map(int, parts[1:])
+                if not (0 <= cx < EXPLORE_W and 0 <= cy < EXPLORE_H):
+                    raise ValueError("invalid explored cell")
+                self.explored[cy, cx] = True
+            elif tag == "PATH" and len(parts) >= 3 and len(parts) % 2 == 1:
+                values = list(map(float, parts[1:]))
+                if not all(np.isfinite(values)):
+                    raise ValueError("non-finite path")
+                self.path = (values[0::2], values[1::2])
+            elif tag == "T" and len(parts) == 3:
                 values = tuple(map(float, parts[1:]))
                 if not all(np.isfinite(values)):
                     raise ValueError("non-finite coordinates")
-                if tag == "P":
-                    self.pose = values
-                else:
-                    self.target = values
-            elif tag == "M" and len(parts) == 3:
-                self.motors = tuple(map(int, parts[1:]))
-            elif tag == "S" and len(parts) == 3:
-                self.state_info = tuple(map(int, parts[1:]))
-            elif tag == "D":
-                self.diag = line[2:]
+                self.target = values
             else:
-                match = POSE_DEBUG_RE.search(line)
-                if match:
-                    x, y, theta_deg = map(float, match.groups())
-                    self.pose = (x, y, np.radians(theta_deg))
-                else:
-                    self.last_message = line[:160]
-                    return
+                self.last_message = line[:160]
+                return
             self.telemetry_count += 1
-        except (ValueError, OverflowError):
+        except (ValueError, OverflowError, KeyError):
             self.bad_lines += 1
 
     def _read_serial(self):
@@ -249,19 +290,34 @@ class Visualiser:
         if self.closed:
             return ()
         self._read_serial()
-        self.mesh.set_array(self.grid.ravel())
+        self.mesh.set_array(self._display_scores().ravel())
+        self.explore_mesh.set_array(self._unexplored().ravel())
+        self.path_line.set_data(*(self.path if self.path is not None else ([], [])))
         for dot, position in ((self.pose_dot, self.pose),
                               (self.target_dot, self.target)):
             dot.set_data([position[0]], [position[1]]) if position is not None else dot.set_data([], [])
+        if self.pose is not None:
+            x, y, theta = self.pose
+            self.heading_arrow.set_offsets([[x, y]])
+            self.heading_arrow.set_UVC([HEADING_ARROW_M * np.cos(theta)],
+                                       [HEADING_ARROW_M * np.sin(theta)])
+        self.heading_arrow.set_visible(self.pose is not None)
         lines = []
-        if self.motors is not None:
-            lines.append(f"motors: L={self.motors[0]:>4} R={self.motors[1]:>4}")
-        if self.state_info is not None:
-            state, busy = self.state_info
-            name = STATE_NAMES[state] if 0 <= state < len(STATE_NAMES) else f"?{state}"
-            lines.append(f"state: {name}  busy={bool(busy)}")
-        if self.diag is not None:
-            lines.append(f"sensors: {self.diag}")
+        if self.tel is not None:
+            t = self.tel.get
+            left, _, right = t("motors", "?/?").partition("/")
+            lines += [
+                f"state:   {t('state', '?')}   collect: {t('collect', '?')}",
+                f"pose:    x={t('x')} y={t('y')} th={t('th')} deg",
+                f"motors:  L={left:>4} R={right:>4}",
+                f"catch:   ind={t('ind')} ind_det={t('ind_det')} ir_det={t('ir_det')}",
+                f"imu cal: {t('cal', '?')} (sys/gyro/accel/mag, 3 = good)",
+            ]
+        if self.tofs:
+            cells = [f"{name}={value:>4}" for name, value in self.tofs]
+            half = (len(cells) + 1) // 2
+            lines.append("tof mm:  " + "  ".join(cells[:half]))
+            lines.append("         " + "  ".join(cells[half:]))
         self.info_text.set_text("\n".join(lines))
         status = self.status
         if self.ser is not None:
@@ -274,7 +330,8 @@ class Visualiser:
             f"{self.cell_updates} | Invalid records: {self.bad_lines}\n"
             f"Robot: {self.last_message}"
         )
-        return self.mesh, self.pose_dot, self.target_dot, self.info_text, self.connection_text
+        return (self.mesh, self.explore_mesh, self.path_line, self.pose_dot, self.heading_arrow,
+                self.target_dot, self.info_text, self.connection_text)
 
     def close(self, _event=None):
         self.closed = True

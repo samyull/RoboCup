@@ -9,7 +9,6 @@
 void ir_proximity_init();
 
 // Returns true if an object is currently detected.
-// Polarity TODO: confirm via raw digitalRead test below before trusting this.
 bool ir_proximity_detected();
 
 #endif

@@ -1,5 +1,4 @@
 #include "arms.h"
-#include "electromagnets.h"
 #include <Arduino.h>
 #include <Servo.h>
 
@@ -42,7 +41,7 @@ static uint32_t crane_last_ms = 0;
 
 // Temporary command-timing diagnostics. Only print after a move completes,
 // so serial output does not disturb the updates being measured.
-static const bool CRANE_TIMING_ENABLED = true;
+static const bool CRANE_TIMING_ENABLED = false;  // set true to print a summary after each crane move
 static bool crane_timing_active = false;
 static uint32_t crane_timing_last_us = 0;
 static uint64_t crane_timing_total_us = 0;
@@ -71,12 +70,6 @@ static void write_crane(float degrees) {
   // writeMicroseconds gives finer steps than write(), so slow moves are smooth
   int us = CRANE_US_MIN + (int)(degrees * (CRANE_US_MAX - CRANE_US_MIN) / 180.0f);
   crane.writeMicroseconds(us);
-}
-
-void set_crane_angle(int degrees) {
-  crane_timing_active = false; // direct positioning cancels any measured ramp
-  crane_target = clamp_angle(degrees);
-  write_crane(crane_target);
 }
 
 void move_crane_to(int degrees, float deg_per_sec) {
@@ -128,38 +121,4 @@ void crane_update() {
 
 bool crane_at_target() {
   return crane_pos == crane_target;
-}
-
-void move_crane_blocking(int degrees, float deg_per_sec) {
-  move_crane_to(degrees, deg_per_sec);
-  while (!crane_at_target()) {
-    crane_update();
-    delay(10);
-  }
-}
-
-void crane_test() {
-  Serial.println("Crane 37 deg");
-  move_crane_blocking(37, 20);
-  delay(500);
-
-  Serial.println("To Releasing Position");
-  move_crane_blocking(42, 15);
-  delay(2000);
-  Serial.println("Electromagnets OFF");
-  electromagnets_off();
-
-  Serial.println("Crane 63 deg");
-  move_crane_blocking(63, 100);
-  delay(1000);
-
-  Serial.println("To Idle Position");
-  move_crane_blocking(50, 100);
-  delay(1000);
-
-  Serial.println("To Picking Up Position");
-  move_crane_blocking(63, 15);
-  delay(1000);
-  Serial.println("Electromagnets ON");
-  electromagnets_on();
 }

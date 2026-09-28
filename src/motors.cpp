@@ -11,7 +11,6 @@ void motors_init() {
   Serial.println("Motors have been initialised \n");
 }
 
-// In motors.cpp, before speed_to_us's existing clamp:
 static int apply_min_power(int speed_pct) {
   const int MIN_EFFECTIVE_PCT = 60;   // TODO: confirm exact value on the real drivetrain
   if (speed_pct == 0) return 0;       // 0 still means "stop", not "min power"

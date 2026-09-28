@@ -1,6 +1,8 @@
 #ifndef WEIGHT_COLLECTION_H
 #define WEIGHT_COLLECTION_H
 
+#include <stdint.h>
+
 // Non-blocking weight pickup / clearing / release logic.
 // Call weight_collection_init() once in setup(), then weight_collection_update()
 // every loop. Nothing here uses delay(), so the main loop keeps running fast.
@@ -32,7 +34,10 @@ bool weight_collection_busy();
 bool weight_collection_feeding();
 
 WeightState weight_collection_state();
+const char *weight_collection_state_name();
 int weight_collection_count();   // pickups since the last release
+uint32_t weight_collection_total_pickups();  // completed pickups since boot
+uint32_t weight_collection_total_clears();   // completed clearing-arm sweeps since boot
 
 void weight_collection_request_release();
 

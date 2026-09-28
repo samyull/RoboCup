@@ -25,12 +25,25 @@ struct TofReading {
   uint16_t range_mm = 0;
   uint32_t received_ms = 0;
   uint32_t sequence = 0;
-  bool valid = false;
+  bool valid = false;      // measured a distance (range_mm)
+  bool no_target = false;  // sensor working, but nothing within its range (empty space)
   bool new_this_loop = false;
 };
 
-// Valid measurement received within the allowed age; never substitutes clear space.
+// Short label for a TofIndex, e.g. "LST".
+const char *tof_name(uint8_t index);
+
+// Valid distance received within the allowed age.
 bool tof_reading_usable(const TofReading &reading);
+
+// Recent measurement found nothing within range: treat as empty space, not a failure.
+bool tof_reading_no_target(const TofReading &reading);
+
+// Recent result of either kind; false only when the sensor is failing or stale.
+bool tof_reading_live(const TofReading &reading);
+
+// Mark a reading as unavailable (e.g. while it may be outdated).
+void tof_reading_clear(TofReading &reading);
 
 // Initializes the SX1509 expander, resets all sensors via XSHUT, brings
 // each sensor up one at a time and assigns it a unique I2C address.
@@ -40,8 +53,5 @@ bool tof_init();
 // Poll ready sensors only. Caller retains this array between calls.
 // Layout follows TofIndex.
 void tof_read(TofReading ranges[TOF_TOTAL_COUNT]);
-
-// Per-sensor timeout check.
-bool tof_timeout_occurred(uint8_t sensor_index);
 
 #endif

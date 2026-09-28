@@ -10,7 +10,7 @@
 static const int      CRANE_IDLE_ANGLE     = 50;
 static const float    CRANE_IDLE_SPEED     = 100.0f;  // deg/s
 static const uint32_t INDUCTION_TIMEOUT_MS = 5000;
-static const int      PICKUPS_BEFORE_RELEASE = 30;
+static const int      PICKUPS_BEFORE_RELEASE = 3;   // capacity: stop collecting until released at home
 
 // TODO: confirm rest/active angles on the robot (taken from the old arm test).
 static const int      CLEARING_ARM_REST    = 180;
@@ -20,7 +20,7 @@ static const int      RELEASE_ARM_ACTIVE   = 120;
 static const uint32_t ARM_HOLD_MS          = 1000;  // time held at the active angle
 static const uint32_t ARM_RETURN_MS        = 700;   // time allowed to swing back to rest
 
-// --- Pickup sequence (same moves as crane_test(), starting from idle) ---
+// --- Pickup sequence, starting from idle ---
 enum MagnetAction { MAG_NONE, MAG_ON, MAG_OFF };
 
 struct CraneStep {
@@ -31,11 +31,11 @@ struct CraneStep {
 };
 
 static const CraneStep PICKUP_STEPS[] = {
-  {63,  100, 1000, MAG_ON },   // lower slowly onto the weight, magnets on
-  {63,   25, 1000, MAG_NONE},  // let the magnets grab
-  {39,  100,  500, MAG_NONE},  // lift
-  {42,  100, 2000, MAG_OFF },  // settle, drop the weight
-  {57,  100, 1000, MAG_NONE},
+  {63,  100, 300, MAG_ON },   // lower slowly onto the weight, magnets on
+  {65,  50,  500, MAG_NONE},  // let the magnets grab
+  {34,  50,  200, MAG_NONE},  // lift
+  {42,  100, 1000, MAG_OFF },  // settle, drop the weight
+  {40,  100, 300, MAG_NONE},
   {CRANE_IDLE_ANGLE, CRANE_IDLE_SPEED, 0, MAG_NONE},  // back to idle
 };
 static const int PICKUP_STEP_COUNT = sizeof(PICKUP_STEPS) / sizeof(PICKUP_STEPS[0]);
@@ -44,6 +44,10 @@ static const int PICKUP_STEP_COUNT = sizeof(PICKUP_STEPS) / sizeof(PICKUP_STEPS[
 static WeightState state = WC_SCANNING;
 static uint32_t state_start_ms = 0;
 static int pickup_count = 0;
+// Running totals since boot (never reset), so callers can tell what happened
+// while they were paused even if pickup_count was reset by a release.
+static uint32_t total_pickups = 0;
+static uint32_t total_clears = 0;
 
 static int step_index = 0;
 static bool step_arrived = false;
@@ -53,7 +57,7 @@ static bool arm_returning = false;
 
 static const char *state_name(WeightState s) {
   switch (s) {
-    case WC_SCANNING:              return "SCANNING";
+    case WC_SCANNING:              return "IDLE";  // not the robot's SCANNING state
     case WC_WAITING_FOR_INDUCTION: return "WAITING_FOR_INDUCTION";
     case WC_PICKUP:                return "PICKUP";
     case WC_CLEARING:              return "CLEARING";
@@ -113,6 +117,7 @@ static void update_pickup() {
 
   // Sequence finished, crane back at idle.
   pickup_count++;
+  total_pickups++;
   Serial.print("Pickup complete, count = ");
   Serial.println(pickup_count);
   set_state(WC_SCANNING);
@@ -142,6 +147,7 @@ static void update_arm() {
   if (elapsed < ARM_HOLD_MS + ARM_RETURN_MS) return;
 
   if (state == WC_RELEASING) pickup_count = 0;
+  if (state == WC_CLEARING) total_clears++;
   set_state(WC_SCANNING);
 }
 
@@ -162,11 +168,12 @@ void weight_collection_update() {
 
   switch (state) {
     case WC_SCANNING:
-      if (pickup_count >= PICKUPS_BEFORE_RELEASE) {
-        if (release_requested) {
-          start_arm(WC_RELEASING);
-          release_requested = false;
-        }
+      if (release_requested) {
+        // At home (any load, e.g. the 90 s return with 1-2 on board). Keep the
+        // request until the interlock lets the arm start; nothing to drop = done.
+        if (pickup_count == 0 || start_arm(WC_RELEASING)) release_requested = false;
+      } else if (pickup_count >= PICKUPS_BEFORE_RELEASE) {
+        // Full: ignore the catchment until released at home.
       } else if (induction) {
         start_pickup();
       } else if (proximity) {
@@ -209,6 +216,18 @@ WeightState weight_collection_state() {
   return state;
 }
 
+const char *weight_collection_state_name() {
+  return state_name(state);
+}
+
 int weight_collection_count() {
   return pickup_count;
+}
+
+uint32_t weight_collection_total_pickups() {
+  return total_pickups;
+}
+
+uint32_t weight_collection_total_clears() {
+  return total_clears;
 }

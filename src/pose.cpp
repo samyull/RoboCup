@@ -136,7 +136,58 @@ void pose_init(uint8_t flow_chip_select) {
   pose_reset();
 }
 
+// ---------------------------------------------------------------------------
+// Pose history - lets a ToF reading be placed using the pose at the moment it
+// was measured rather than when it was read out (matters while turning).
+// ---------------------------------------------------------------------------
+
+static const int POSE_HISTORY_LEN = 32;  // ~1 s at the loop rate; readings are < 0.2 s old
+struct PoseSample {
+  uint32_t ms;
+  Pose pose;
+};
+static PoseSample pose_history[POSE_HISTORY_LEN];
+static int pose_history_count = 0;
+static int pose_history_next = 0;  // slot the next sample is written to
+
+static void clear_pose_history() {
+  pose_history_count = 0;
+  pose_history_next = 0;
+}
+
+static void record_pose_sample(uint32_t ms, const Pose &pose) {
+  pose_history[pose_history_next] = {ms, pose};
+  pose_history_next = (pose_history_next + 1) % POSE_HISTORY_LEN;
+  if (pose_history_count < POSE_HISTORY_LEN) ++pose_history_count;
+}
+
+bool pose_at(uint32_t t_ms, Pose &out) {
+  if (pose_history_count == 0) return false;
+  // Walk from the newest sample back to the first one at or before t_ms.
+  int newer = (pose_history_next - 1 + POSE_HISTORY_LEN) % POSE_HISTORY_LEN;
+  if ((int32_t)(t_ms - pose_history[newer].ms) >= 0) {
+    out = pose_history[newer].pose;  // at or after the newest: best available
+    return true;
+  }
+  for (int k = 1; k < pose_history_count; ++k) {
+    const int older = (newer - 1 + POSE_HISTORY_LEN) % POSE_HISTORY_LEN;
+    const PoseSample &a = pose_history[older];
+    const PoseSample &b = pose_history[newer];
+    if ((int32_t)(t_ms - a.ms) >= 0) {
+      const float span = (float)(b.ms - a.ms);
+      const float f = span > 0.0f ? (float)(t_ms - a.ms) / span : 0.0f;
+      out.x = a.pose.x + f * (b.pose.x - a.pose.x);
+      out.y = a.pose.y + f * (b.pose.y - a.pose.y);
+      out.theta = wrap_angle(a.pose.theta + f * wrap_angle(b.pose.theta - a.pose.theta));
+      return true;
+    }
+    newer = older;
+  }
+  return false;  // older than the history covers
+}
+
 void pose_reset() {
+  clear_pose_history();
   current_pose = Pose();
   last_angular_speed = 0.0f;
   have_heading_sample_time = false;
@@ -164,9 +215,26 @@ void pose_reset() {
 }
 
 void pose_set_position(float x_m, float y_m) {
+  clear_pose_history();  // earlier samples are in the old frame
   current_pose.x = x_m;
   current_pose.y = y_m;
   // theta is deliberately left untouched - see pose.h for why.
+}
+
+void pose_nudge_position(float dx_m, float dy_m) {
+  current_pose.x += dx_m;
+  current_pose.y += dy_m;
+  for (int i = 0; i < pose_history_count; ++i) {
+    pose_history[i].pose.x += dx_m;
+    pose_history[i].pose.y += dy_m;
+  }
+}
+
+void pose_set_heading(float theta_rad) {
+  clear_pose_history();  // earlier samples are in the old frame
+  // theta = heading_ccw - theta_offset, so shift the offset by the change.
+  theta_offset = wrap_angle(theta_offset + current_pose.theta - theta_rad);
+  current_pose.theta = wrap_angle(theta_rad);
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +249,8 @@ void pose_resume_after_collection() {
   discard_stationary_flow = true;
 }
 
-Pose pose_update() {
+// One integration step; pose_update() wraps it to record the result.
+static Pose integrate_step() {
   float d_theta = 0.0f;                 // heading change this step (rad, CCW+)
   float theta_mid = current_pose.theta; // heading half-way through the step
   last_angular_speed = NAN; // No measurement must not look like zero rotation.
@@ -196,8 +265,9 @@ Pose pose_update() {
     if (last_euler_read_ok) {
       const uint32_t sample_us = micros();
       float heading_ccw = -radians(last_heading_deg_raw);
-      // If reset could not read the IMU, establish the origin on recovery.
-      if (!have_heading_sample_time) theta_offset = wrap_angle(heading_ccw);
+      // If reset could not read the IMU, establish the origin on recovery,
+      // keeping whatever heading was set (0 after reset, or the start layout's).
+      if (!have_heading_sample_time) theta_offset = wrap_angle(heading_ccw - current_pose.theta);
       float new_theta = wrap_angle(heading_ccw - theta_offset);
 
       d_theta = wrap_angle(new_theta - current_pose.theta);   // wrap-safe across +-pi
@@ -264,6 +334,17 @@ Pose pose_update() {
   return current_pose;
 }
 
+Pose pose_current() {
+  return current_pose;
+}
+
+Pose pose_update() {
+  const Pose p = integrate_step();
+  // Only samples with a fresh heading are trustworthy for placing readings.
+  if (last_euler_read_ok) record_pose_sample(millis(), p);
+  return p;
+}
+
 float angular_speed_rad_s() {
     return last_angular_speed;
   }
@@ -285,32 +366,7 @@ bool pose_heading_stale() {
          (uint32_t)(millis() - last_heading_sample_ms) >= HEADING_TIMEOUT_MS;
 }
 
-void pose_print_debug() {
-  uint8_t sys_cal = 0, gyro_cal = 0, accel_cal = 0, mag_cal = 0;
-  if (imu_ready) {
-    bno.getCalibration(&sys_cal, &gyro_cal, &accel_cal, &mag_cal);
-  }
-
-  Serial.print("[pose] imu_ready="); Serial.print(imu_ready);
-  Serial.print(" flow_ready="); Serial.print(flow_ready);
-  Serial.print(" euler_ok="); Serial.print(last_euler_read_ok);
-  // getSystemStatus() includes delay(200) in this library: startup only.
-  Serial.print(" | cal(sys,gyro,accel,mag)=");
-  Serial.print(sys_cal); Serial.print(",");
-  Serial.print(gyro_cal); Serial.print(",");
-  Serial.print(accel_cal); Serial.print(",");
-  Serial.print(mag_cal);
-  Serial.print(" | raw_heading_deg="); Serial.print(last_heading_deg_raw, 1);
-  if (imu_ready) {
-    // Raw (non-fused) gyro reading, direct from the sensor - if this moves
-    // when you rotate the robot but heading still doesn't, fusion is the
-    // problem. If this ALSO never changes, the chip/wiring itself is dead.
-    imu::Vector<3> gyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
-    Serial.print(" raw_gyro_z="); Serial.print(gyro.z(), 2);
-  }
-  Serial.print(" | raw_dx="); Serial.print(last_dx_counts);
-  Serial.print(" raw_dy="); Serial.print(last_dy_counts);
-  Serial.print(" | x="); Serial.print(current_pose.x, 3);
-  Serial.print(" y="); Serial.print(current_pose.y, 3);
-  Serial.print(" theta_deg="); Serial.println(degrees(current_pose.theta), 1);
+void pose_get_calibration(uint8_t &sys, uint8_t &gyro, uint8_t &accel, uint8_t &mag) {
+  sys = gyro = accel = mag = 0;
+  if (imu_ready) bno.getCalibration(&sys, &gyro, &accel, &mag);
 }

@@ -22,13 +22,3 @@ void electromagnets_off() {
 bool electromagnets_are_on() {
   return magnets_on;
 }
-
-void electromagnets_test() {
-  Serial.println("Electromagnets ON");
-  electromagnets_on();
-  delay(2000);
-
-  Serial.println("Electromagnets OFF");
-  electromagnets_off();
-  delay(2000);
-}
