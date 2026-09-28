@@ -3,7 +3,6 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <Bitcraze_PMW3901.h>
-#include <FastLED.h>
 
 // ---------------------------------------------------------------------------
 // Flow sensor calibration / mounting
@@ -34,7 +33,9 @@ static const float FLOW_OFFSET_LEFT_M = -0.13825f;
 // State
 // ---------------------------------------------------------------------------
 
-static Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire1);
+static const uint8_t IMU_ADDRESS = 0x28;
+static const uint32_t HEADING_TIMEOUT_MS = 200;
+static Adafruit_BNO055 bno = Adafruit_BNO055(55, IMU_ADDRESS, &Wire1);
 static Bitcraze_PMW3901 *flow_sensor = nullptr;
 
 static Pose current_pose;
@@ -48,12 +49,41 @@ static int16_t last_dx_counts = 0;
 static int16_t last_dy_counts = 0;
 static bool last_euler_read_ok = false;
 
+static uint32_t last_heading_sample_us = 0;
+static bool have_heading_sample_time = false;
+static bool discard_stationary_flow = false;
+static uint32_t last_heading_sample_ms = 0;
+static float pending_flow_fwd_m = 0.0f;
+static float pending_flow_left_m = 0.0f;
+
+// getEvent() does not propagate I2C failures in the installed library.
+// Read the little-endian heading directly, using the same degree scale.
+static bool read_heading(float &heading_deg) {
+  Wire1.beginTransmission(IMU_ADDRESS);
+  Wire1.write((uint8_t)Adafruit_BNO055::BNO055_EULER_H_LSB_ADDR);
+  if (Wire1.endTransmission(false) != 0) return false;
+  const uint8_t received = Wire1.requestFrom(IMU_ADDRESS, (uint8_t)2);
+  if (received != 2 || Wire1.available() != 2) {
+    while (Wire1.available()) Wire1.read();
+    return false;
+  }
+  const uint8_t lo = Wire1.read();
+  const uint8_t hi = Wire1.read();
+  const uint16_t raw = (uint16_t)lo | ((uint16_t)hi << 8);
+  if (raw >= 360U * 16U) return false;
+  heading_deg = raw / 16.0f;
+  return true;
+}
+
 /* Wrap an angle in radians to [-pi, pi]. */
 static float wrap_angle(float angle_rad) {
   while (angle_rad > PI)  angle_rad -= 2.0f * PI;
   while (angle_rad < -PI) angle_rad += 2.0f * PI;
   return angle_rad;
 }
+
+static float last_angular_speed = 0.0f;
+
 
 // ---------------------------------------------------------------------------
 // Init / reset (init sequence unchanged from the version that worked)
@@ -108,14 +138,21 @@ void pose_init(uint8_t flow_chip_select) {
 
 void pose_reset() {
   current_pose = Pose();
+  last_angular_speed = 0.0f;
+  have_heading_sample_time = false;
+  last_euler_read_ok = false;
+  pending_flow_fwd_m = pending_flow_left_m = 0.0f;
 
   if (imu_ready) {
-    sensors_event_t orientation;
-    if (bno.getEvent(&orientation, Adafruit_BNO055::VECTOR_EULER)) {
+    last_euler_read_ok = read_heading(last_heading_deg_raw);
+    if (last_euler_read_ok) {
+      last_heading_sample_us = micros();
+      last_heading_sample_ms = millis();
+      have_heading_sample_time = true;
       // BNO055 Euler heading is degrees, clockwise-positive, 0-360.
       // Convert to radians, counter-clockwise-positive, and remember it so
       // that the current heading reads as theta = 0 right now.
-      theta_offset = wrap_angle(-radians(orientation.orientation.x));
+      theta_offset = wrap_angle(-radians(last_heading_deg_raw));
     }
   }
 
@@ -136,23 +173,43 @@ void pose_set_position(float x_m, float y_m) {
 // Localisation
 // ---------------------------------------------------------------------------
 
+void pose_resume_after_collection() {
+  // Translation during the stopped collection interval is unobserved. Preserve
+  // x/y, discard accumulated flow, and reacquire absolute heading without
+  // applying a rotation correction for an interval whose flow was discarded.
+  pending_flow_fwd_m = pending_flow_left_m = 0.0f;
+  discard_stationary_flow = true;
+}
+
 Pose pose_update() {
   float d_theta = 0.0f;                 // heading change this step (rad, CCW+)
   float theta_mid = current_pose.theta; // heading half-way through the step
+  last_angular_speed = NAN; // No measurement must not look like zero rotation.
+  last_euler_read_ok = false;
+  const bool had_heading = have_heading_sample_time;
 
   // --- Heading from BNO055 ---
   if (imu_ready) {
-    sensors_event_t orientation;
-    last_euler_read_ok = bno.getEvent(&orientation, Adafruit_BNO055::VECTOR_EULER);
+    last_euler_read_ok = read_heading(last_heading_deg_raw);
 
-    // Only use the reading if the read succeeded - a failed read leaves the
-    // event zeroed, which would look like a sudden jump to heading 0.
+    // A failed transaction leaves the last valid heading untouched.
     if (last_euler_read_ok) {
-      last_heading_deg_raw = orientation.orientation.x;
+      const uint32_t sample_us = micros();
       float heading_ccw = -radians(last_heading_deg_raw);
+      // If reset could not read the IMU, establish the origin on recovery.
+      if (!have_heading_sample_time) theta_offset = wrap_angle(heading_ccw);
       float new_theta = wrap_angle(heading_ccw - theta_offset);
 
       d_theta = wrap_angle(new_theta - current_pose.theta);   // wrap-safe across +-pi
+      // Time the heading samples, including sensor reads and loop delays.
+      // Unsigned subtraction also handles micros() wrapping around.
+      const uint32_t elapsed_us = sample_us - last_heading_sample_us;
+      if (have_heading_sample_time && elapsed_us > 0) {
+        last_angular_speed = d_theta / (elapsed_us * 1.0e-6f);
+      }
+      last_heading_sample_us = sample_us;
+      last_heading_sample_ms = millis();
+      have_heading_sample_time = true;
       theta_mid = wrap_angle(current_pose.theta + 0.5f * d_theta);
       current_pose.theta = new_theta;
     }
@@ -161,12 +218,31 @@ Pose pose_update() {
   // --- Position from PMW3901 optical flow, rotated into the global frame ---
   if (flow_ready) {
     flow_sensor->readMotionCount(&last_dx_counts, &last_dy_counts);
+    if (discard_stationary_flow) {
+      pending_flow_fwd_m = pending_flow_left_m = 0.0f;
+      discard_stationary_flow = !last_euler_read_ok;
+      last_angular_speed = NAN;
+      return current_pose;
+    }
 
     // Sensor axes -> body frame (x forward, y left), counts -> metres.
     float fwd_counts  = FLOW_SWAP_XY ? last_dy_counts : last_dx_counts;
     float left_counts = FLOW_SWAP_XY ? last_dx_counts : last_dy_counts;
     float sx = fwd_counts  * FLOW_SIGN_FWD  * FLOW_METERS_PER_COUNT;
     float sy = left_counts * FLOW_SIGN_LEFT * FLOW_METERS_PER_COUNT;
+
+    // Keep flow and heading changes over the same interval across a brief
+    // failed read. Do not rotate flow into the map using a stale heading.
+    if (!had_heading) {
+      pending_flow_fwd_m = pending_flow_left_m = 0.0f;
+      return current_pose;
+    }
+    pending_flow_fwd_m += sx;
+    pending_flow_left_m += sy;
+    if (!last_euler_read_ok) return current_pose;
+    sx = pending_flow_fwd_m;
+    sy = pending_flow_left_m;
+    pending_flow_fwd_m = pending_flow_left_m = 0.0f;
 
     // An off-centre sensor sweeps along an arc when the robot rotates and
     // reports that as movement: reported = true + (R(d_theta) - I) * offset.
@@ -188,9 +264,9 @@ Pose pose_update() {
   return current_pose;
 }
 
-Pose pose_get() {
-  return current_pose;
-}
+float angular_speed_rad_s() {
+    return last_angular_speed;
+  }
 
 bool pose_imu_ready() {
   return imu_ready;
@@ -198,6 +274,15 @@ bool pose_imu_ready() {
 
 bool pose_flow_ready() {
   return flow_ready;
+}
+
+bool pose_heading_valid() {
+  return imu_ready && last_euler_read_ok && !pose_heading_stale();
+}
+
+bool pose_heading_stale() {
+  return !imu_ready || !have_heading_sample_time ||
+         (uint32_t)(millis() - last_heading_sample_ms) >= HEADING_TIMEOUT_MS;
 }
 
 void pose_print_debug() {
@@ -209,11 +294,7 @@ void pose_print_debug() {
   Serial.print("[pose] imu_ready="); Serial.print(imu_ready);
   Serial.print(" flow_ready="); Serial.print(flow_ready);
   Serial.print(" euler_ok="); Serial.print(last_euler_read_ok);
-  if (imu_ready) {
-    uint8_t sys_status, self_test, sys_err;
-    bno.getSystemStatus(&sys_status, &self_test, &sys_err);
-    Serial.print(" sys_status="); Serial.print(sys_status);
-  }
+  // getSystemStatus() includes delay(200) in this library: startup only.
   Serial.print(" | cal(sys,gyro,accel,mag)=");
   Serial.print(sys_cal); Serial.print(",");
   Serial.print(gyro_cal); Serial.print(",");

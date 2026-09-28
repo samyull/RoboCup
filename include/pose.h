@@ -40,6 +40,9 @@ void pose_init(uint8_t flow_chip_select);
  */
 Pose pose_update();
 
+// Reacquire heading and discard flow accumulated while collection held driving stopped.
+void pose_resume_after_collection();
+
 /**
  * @return the most recently computed pose without taking a new reading.
  */
@@ -57,6 +60,12 @@ void pose_reset();
  *         updated at all.
  */
 bool pose_imu_ready();
+
+// Latest heading transaction succeeded and the sample is less than 200 ms old.
+bool pose_heading_valid();
+
+// No heading received yet, or at least 200 ms since the last valid sample.
+bool pose_heading_stale();
 
 /**
  * @return true if the PMW3901 was detected and initialised successfully.
@@ -86,5 +95,7 @@ extern float FLOW_METERS_PER_COUNT;
 void pose_print_debug();
 
 void pose_set_position(float x_m, float y_m);
+
+float angular_speed_rad_s();
 
 #endif // POSE_H

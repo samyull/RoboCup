@@ -3,13 +3,14 @@
 #include "electromagnets.h"
 #include "induction.h"
 #include "ir_proximity.h"
+#include "motors.h"
 #include <Arduino.h>
 
 // --- Tuning ---
 static const int      CRANE_IDLE_ANGLE     = 50;
 static const float    CRANE_IDLE_SPEED     = 100.0f;  // deg/s
 static const uint32_t INDUCTION_TIMEOUT_MS = 5000;
-static const int      PICKUPS_BEFORE_RELEASE = 3;
+static const int      PICKUPS_BEFORE_RELEASE = 30;
 
 // TODO: confirm rest/active angles on the robot (taken from the old arm test).
 static const int      CLEARING_ARM_REST    = 180;
@@ -30,11 +31,11 @@ struct CraneStep {
 };
 
 static const CraneStep PICKUP_STEPS[] = {
-  {63,  15, 1000, MAG_ON },   // lower slowly onto the weight, magnets on
-  {63,  15, 1000, MAG_NONE},  // let the magnets grab
-  {37,  20,  500, MAG_NONE},  // lift
-  {42,  15, 2000, MAG_OFF },  // settle, drop the weight
-  {63, 100, 1000, MAG_NONE},
+  {63,  100, 1000, MAG_ON },   // lower slowly onto the weight, magnets on
+  {63,   25, 1000, MAG_NONE},  // let the magnets grab
+  {39,  100,  500, MAG_NONE},  // lift
+  {42,  100, 2000, MAG_OFF },  // settle, drop the weight
+  {57,  100, 1000, MAG_NONE},
   {CRANE_IDLE_ANGLE, CRANE_IDLE_SPEED, 0, MAG_NONE},  // back to idle
 };
 static const int PICKUP_STEP_COUNT = sizeof(PICKUP_STEPS) / sizeof(PICKUP_STEPS[0]);
@@ -87,6 +88,7 @@ void weight_collection_request_release() {
 
 
 static void start_pickup() {
+  stop_motors();
   set_state(WC_PICKUP);
   start_step(0);
 }
@@ -119,6 +121,7 @@ static void update_pickup() {
 // Tries to start an arm swing; stays in SCANNING if the interlock blocks it.
 static bool start_arm(WeightState arm_state) {
   if (!arms_safe_to_move()) return false;
+  stop_motors();
   arm_returning = false;
   set_state(arm_state);
   if (arm_state == WC_CLEARING) set_clearing_arm_angle(CLEARING_ARM_ACTIVE);
@@ -164,7 +167,7 @@ void weight_collection_update() {
           start_arm(WC_RELEASING);
           release_requested = false;
         }
-      } else if (proximity && induction) {
+      } else if (induction) {
         start_pickup();
       } else if (proximity) {
         set_state(WC_WAITING_FOR_INDUCTION);
@@ -176,7 +179,9 @@ void weight_collection_update() {
       if (induction) {
         start_pickup();
       } else if (millis() - state_start_ms >= INDUCTION_TIMEOUT_MS) {
-        if (!start_arm(WC_CLEARING)) set_state(WC_SCANNING);
+        // Stay stopped and retry if the crane interlock is not ready yet.
+        stop_motors();
+        start_arm(WC_CLEARING);
       }
       break;
 
@@ -193,6 +198,11 @@ void weight_collection_update() {
 
 bool weight_collection_busy() {
   return state != WC_SCANNING;
+}
+
+bool weight_collection_feeding() {
+  return state == WC_WAITING_FOR_INDUCTION &&
+         millis() - state_start_ms < INDUCTION_TIMEOUT_MS;
 }
 
 WeightState weight_collection_state() {

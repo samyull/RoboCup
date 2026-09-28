@@ -16,7 +16,7 @@ enum StateMachine : int8_t {
 void state_machine_init();
 
 /**
- * Call every loop, AFTER pose_update()/map_update()/tof_classify_readings(),
+ * Call every loop, AFTER pose_update()/tof_classify_readings(),
  * and ONLY when weight_collection_busy() is false - the catchment interrupt
  * (induction + IR proximity -> pickup) takes full priority over navigation,
  * and while it's busy this function should simply not be called at all, so
@@ -26,8 +26,10 @@ void state_machine_init();
  * weight_seen_this_frame should be tof_classify_readings()'s return value
  * from this same loop.
  */
-void state_machine_update(const Pose &pose, const uint16_t ranges[TOF_TOTAL_COUNT],
+void state_machine_update(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
                            bool weight_seen_this_frame, int &out_left_pct, int &out_right_pct);
+
+void run_scanning(const Pose &pose, int &left_pct, int &right_pct);
 
 StateMachine state_machine_current_state();
 

@@ -9,6 +9,10 @@
 static const uint32_t WEIGHT_LOST_TIMEOUT_MS = 2500;   // no fresh sighting -> scan (only if map is empty)
 static const int WEIGHTS_BEFORE_HOME = 3;
 
+static const int   APPROACH_SPEED_PCT = 75;   // TODO: find the sweet spot on the bench
+static const float APPROACH_TURN_KP   = 40.0f; // gentler than general navigation - funnel forgives error
+static const int   MAX_APPROACH_TURN_PCT = 30;
+
 // APPROACH_VERIFY: rotate to face the target and confirm it before driving
 static const float ALIGN_TOLERANCE_RAD = radians(5.0f);
 static const int   VERIFY_TURN_PCT = 35;
@@ -16,7 +20,7 @@ static const uint32_t VERIFY_ALIGN_TIMEOUT_MS = 2000;  // safety - don't spin fo
 
 // SCANNING: stop-and-sample sweep. Coarse steps + short settle to keep this
 // cheap given the 2-minute round - see conversation notes on TOF timing.
-static const float    SCAN_STEP_DEG = 45.0f;
+static const float    SCAN_STEP_DEG = 15.0f;
 static const uint32_t SCAN_SETTLE_MS = 150;            // >= TOF timing budget (50ms) + margin
 static const int      SCAN_TURN_PCT = 35;
 
@@ -35,12 +39,36 @@ static int waypoint_count = 0;
 static int waypoint_index = 0;
 
 static uint32_t verify_start_ms = 0;
+enum VerifyPhase { VERIFY_ALIGN, VERIFY_SETTLE, VERIFY_OBSERVE };
+static VerifyPhase verify_phase = VERIFY_ALIGN;
+static uint32_t verify_phase_ms = 0;
+static uint32_t verify_observe_after_ms = 0;
+static const uint32_t VERIFY_SETTLE_MS = 150;
+static const uint32_t VERIFY_OBSERVE_TIMEOUT_MS = 1500;
+static const float VERIFY_SETTLE_RATE_RAD_S = 0.10f;
+
+static void begin_verification(const Target &target) {
+  locked_target = target;
+  verify_start_ms = millis();
+  verify_phase = VERIFY_ALIGN;
+  current_state = APPROACH_VERIFY;
+}
+
 
 static int scan_step = 0;
 static int scan_step_count = 0;
 static float scan_start_theta = 0.0f;
 static bool scan_turning = true;
 static uint32_t scan_settle_start_ms = 0;
+
+static void abandon_verification(const Pose &pose) {
+  // No reliable confirmation: search again without deleting map evidence.
+  scan_step = 0;
+  scan_step_count = (int)(360.0f / SCAN_STEP_DEG);
+  scan_start_theta = pose.theta;
+  scan_turning = true;
+  current_state = SCANNING;
+}
 
 static float wrap_angle(float angle_rad) {
   while (angle_rad > PI)  angle_rad -= 2.0f * PI;
@@ -50,9 +78,9 @@ static float wrap_angle(float angle_rad) {
 
 // Overrides out_left_pct/out_right_pct if something is dangerously close,
 // regardless of what navigation decided.
-static void apply_reflex(const uint16_t ranges[TOF_TOTAL_COUNT], int &left_pct, int &right_pct) {
+static void apply_reflex(const TofReading ranges[TOF_TOTAL_COUNT], int &left_pct, int &right_pct) {
   int rl, rr;
-  if (tof_nav_update(ranges, rl, rr) == TOF_NAV_AVOID) {
+  if (tof_nav_update(ranges, rl, rr) != TOF_NAV_CLEAR) {
     left_pct = rl;
     right_pct = rr;
   }
@@ -93,13 +121,11 @@ StateMachine state_machine_current_state() {
   return current_state;
 }
 
-static void run_navigation(const Pose &pose, const uint16_t ranges[TOF_TOTAL_COUNT],
+static void run_navigation(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
                             int &left_pct, int &right_pct) {
   Target found;
   if (find_nearest_weight(pose, found)) {
-    locked_target = found;
-    verify_start_ms = millis();
-    current_state = APPROACH_VERIFY;
+    begin_verification(found);
     left_pct = right_pct = 0;
     return;
   }
@@ -121,59 +147,94 @@ static void run_navigation(const Pose &pose, const uint16_t ranges[TOF_TOTAL_COU
   apply_reflex(ranges, left_pct, right_pct);
 }
 
-static void run_approach_verify(const Pose &pose, bool weight_seen_this_frame,
-                                 int &left_pct, int &right_pct) {
-  float err = heading_error_to(pose, locked_target);
-  bool timed_out = millis() - verify_start_ms >= VERIFY_ALIGN_TIMEOUT_MS;
-
-  if (fabsf(err) > ALIGN_TOLERANCE_RAD && !timed_out) {
-    int turn = err > 0 ? VERIFY_TURN_PCT : -VERIFY_TURN_PCT;
-    left_pct = -turn;
-    right_pct = turn;
+static void run_approach_verify(const Pose &pose, int &left_pct, int &right_pct) {
+  left_pct = right_pct = 0;
+  const uint32_t now = millis();
+  const float err = heading_error_to(pose, locked_target);
+  if (verify_phase == VERIFY_ALIGN) {
+    if (fabsf(err) > ALIGN_TOLERANCE_RAD) {
+      if (now - verify_start_ms >= VERIFY_ALIGN_TIMEOUT_MS) {
+        abandon_verification(pose);
+        return;
+      }
+      const int turn = err > 0 ? VERIFY_TURN_PCT : -VERIFY_TURN_PCT;
+      left_pct = -turn; right_pct = turn;
+      return;
+    }
+    verify_phase = VERIFY_SETTLE;
+    verify_phase_ms = now;
+    return; // stop before beginning any verification
+  }
+  if (fabsf(err) > ALIGN_TOLERANCE_RAD) {
+    // Overshoot requires realignment, never acceptance of an unrelated sighting.
+    verify_phase = VERIFY_ALIGN;
     return;
   }
-
-  // Aligned (or gave up trying to align exactly) - trust this frame's
-  // classification to confirm the weight is actually still there.
-  left_pct = right_pct = 0;
-  if (weight_seen_this_frame) {
+  const float rate = angular_speed_rad_s();
+  if (!pose_heading_valid() || !isfinite(rate) || fabsf(rate) > VERIFY_SETTLE_RATE_RAD_S) {
+    if (now - verify_start_ms >= VERIFY_ALIGN_TIMEOUT_MS + VERIFY_OBSERVE_TIMEOUT_MS) {
+      abandon_verification(pose);
+      return;
+    }
+    verify_phase = VERIFY_SETTLE;
+    verify_phase_ms = now;
+    return;
+  }
+  if (verify_phase == VERIFY_SETTLE) {
+    if (now - verify_phase_ms < VERIFY_SETTLE_MS) return;
+    verify_phase = VERIFY_OBSERVE;
+    verify_phase_ms = now;
+    verify_observe_after_ms = now;
+    return; // require both pair readings to arrive AFTER settling finished
+  }
+  float matched_x, matched_y;
+  if (tof_confirm_target(locked_target.x, locked_target.y, verify_observe_after_ms,
+                         matched_x, matched_y)) {
+    locked_target = {matched_x, matched_y};
     current_state = APPROACH_WEIGHT;
     return;
   }
-
-  // Stale - someone (probably the other robot) got there first, or it was
-  // a false positive. Clear the cell and try the next-nearest, if any.
   int gx, gy;
-  if (world_to_grid(locked_target.x, locked_target.y, gx, gy)) {
-    map_set_cell(gx, gy, MAP_CELL_FREE);
+  if (tof_observation_after(verify_observe_after_ms) &&
+      (!world_to_grid(locked_target.x, locked_target.y, gx, gy) ||
+       map_get_cell(gx, gy) != MAP_CELL_WEIGHT)) {
+    // Normal confidence updates already retired the target; don't clear it twice.
+    abandon_verification(pose);
+    return;
   }
-
-  Target next;
-  if (find_nearest_weight(pose, next)) {
-    locked_target = next;
-    verify_start_ms = millis();
-    // stay in APPROACH_VERIFY, will align to the new target next loop
-  } else {
-    current_state = NAVIGATION;
-  }
+  if (now - verify_phase_ms >= VERIFY_OBSERVE_TIMEOUT_MS) abandon_verification(pose);
 }
 
-static void run_approach_weight(const Pose &pose, const uint16_t ranges[TOF_TOTAL_COUNT],
+static void run_approach_weight(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
                                  int &left_pct, int &right_pct) {
-  // Fallback distance check - the catchment sensors (induction/IR proximity,
-  // handled entirely outside this state machine via weight_collection) are
-  // the primary way a pickup actually happens. This just stops us treating
-  // "still approaching" as the state forever if the sensors miss it.
+  int target_gx, target_gy;
+  if (!world_to_grid(locked_target.x, locked_target.y, target_gx, target_gy) ||
+      map_get_cell(target_gx, target_gy) != MAP_CELL_WEIGHT) {
+    // Confidence decayed or new observations made this target uncollectable.
+    current_state = NAVIGATION;
+    left_pct = right_pct = 0;
+    return;
+  }
+  // Fallback only - real "arrival" is the catchment sensors firing, handled
+  // entirely outside this state machine via weight_collection_busy().
   if (has_arrived(pose, locked_target, WEIGHT_ARRIVAL_RADIUS_M)) {
     current_state = NAVIGATION;
     left_pct = right_pct = 0;
     return;
   }
-  navigate_to_target(pose, locked_target, left_pct, right_pct);
+
+  float err = heading_error_to(pose, locked_target);
+  int turn = (int)(APPROACH_TURN_KP * err);
+  if (turn > MAX_APPROACH_TURN_PCT) turn = MAX_APPROACH_TURN_PCT;
+  if (turn < -MAX_APPROACH_TURN_PCT) turn = -MAX_APPROACH_TURN_PCT;
+
+  left_pct = APPROACH_SPEED_PCT - turn;
+  right_pct = APPROACH_SPEED_PCT + turn;
+
   apply_reflex(ranges, left_pct, right_pct);
 }
 
-static void run_scanning(const Pose &pose, int &left_pct, int &right_pct) {
+void run_scanning(const Pose &pose, int &left_pct, int &right_pct) {
   if (scan_turning) {
     float target_theta = wrap_angle(scan_start_theta + radians(SCAN_STEP_DEG) * scan_step);
     float err = wrap_angle(target_theta - pose.theta);
@@ -199,9 +260,7 @@ static void run_scanning(const Pose &pose, int &left_pct, int &right_pct) {
     // Full sweep done.
     Target found;
     if (find_nearest_weight(pose, found)) {
-      locked_target = found;
-      verify_start_ms = millis();
-      current_state = APPROACH_VERIFY;
+      begin_verification(found);
     } else {
       last_weight_seen_ms = millis();   // don't immediately re-trigger another scan
       current_state = NAVIGATION;
@@ -211,7 +270,7 @@ static void run_scanning(const Pose &pose, int &left_pct, int &right_pct) {
   }
 }
 
-static void run_return_home(const Pose &pose, const uint16_t ranges[TOF_TOTAL_COUNT],
+static void run_return_home(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
                              int &left_pct, int &right_pct) {
   Target home = {0.0f, 0.0f};
 
@@ -227,8 +286,8 @@ static void run_return_home(const Pose &pose, const uint16_t ranges[TOF_TOTAL_CO
   apply_reflex(ranges, left_pct, right_pct);
 }
 
-void state_machine_update(const Pose &pose, const uint16_t ranges[TOF_TOTAL_COUNT],
-                           bool weight_seen_this_frame, int &out_left_pct, int &out_right_pct) {
+void state_machine_update(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT], bool weight_seen_this_frame, int &out_left_pct, int &out_right_pct) {
+
   if (weight_seen_this_frame) {
     last_weight_seen_ms = millis();
   }
@@ -247,7 +306,7 @@ void state_machine_update(const Pose &pose, const uint16_t ranges[TOF_TOTAL_COUN
       run_navigation(pose, ranges, out_left_pct, out_right_pct);
       break;
     case APPROACH_VERIFY:
-      run_approach_verify(pose, weight_seen_this_frame, out_left_pct, out_right_pct);
+      run_approach_verify(pose, out_left_pct, out_right_pct);
       break;
     case APPROACH_WEIGHT:
       run_approach_weight(pose, ranges, out_left_pct, out_right_pct);

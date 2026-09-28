@@ -1,211 +1,307 @@
 #!/usr/bin/env python3
-"""
-Live visualiser for the robot's occupancy grid.
+"""Live robot grid. Install: pip install pyserial matplotlib numpy
 
-Reads lines over serial and renders:
-  - the grid as coloured squares (unknown / free / obstacle / weight / robot cell)
-  - the robot's continuous pose (pose.x, pose.y) as a dark green dot
-  - the current navigation target as an orange dot
+Run: python visualiser.py COM5
+     python visualiser.py COM5 --no-reset
+     python visualiser.py COM5 --debug
 
-Expected serial line formats (one per line, comma-separated):
-  C,gx,gy,value      -> a grid cell update (from map_set_cell's logging)
-  P,x_m,y_m,theta    -> the robot's pose in world coordinates (metres, radians)
-  T,x_m,y_m          -> the current navigation target in world coordinates
-
-The C, line format already matches what map_set_cell() prints.
-P and T are NOT currently printed by main.cpp - add these two lines
-wherever convenient (e.g. once per loop, after map_update()):
-
-    Serial.print("P,"); Serial.print(pose.x, 3); Serial.print(",");
-    Serial.print(pose.y, 3); Serial.print(","); Serial.println(pose.theta, 4);
-
-    Serial.print("T,"); Serial.print(target.x, 3);
-    Serial.print(","); Serial.println(target.y, 3);
-
-If no P/T lines ever arrive, the grid still updates fine - the pose/target
-dots just won't be drawn.
-
-Usage:
-    python visualiser.py COM5          (Windows)
-    python visualiser.py /dev/ttyACM0  (Linux/Mac)
-
-Requires: pyserial, matplotlib, numpy
-    pip install pyserial matplotlib numpy
+Sends R once per launch by default (bench testing: resets robot state).
+Reconnects to the same port after USB reset, without sending R again.
+Firmware must call check_serial_commands() at the start of loop().
+For startup-only map updates, firmware must wait for the serial client
+before map_init(), or provide a full-map resend command. Python cannot
+recover updates sent while USB was disconnected.
 """
 
-import sys
+import argparse
 import re
+import time
+
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.patches import Patch
 import numpy as np
 import serial
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
-from matplotlib.animation import FuncAnimation
 
-# --- Must match grid_map.h on the robot ---
-GRID_W = 100
-GRID_H = 100
+# Must match grid_map.h, including its grid dimensions.
 CELL_SIZE_M = 0.05
-X_ZERO = GRID_W // 2
-Y_ZERO = GRID_H // 2
-
+MARGIN_CELLS = 1
+GRID_SIZE_X_M = 4.9
+GRID_SIZE_Y_M = 2.4
+# round avoids truncating a nominal 48 cells to 47 due to float rounding.
+GRID_W = round(GRID_SIZE_X_M / CELL_SIZE_M) + 2 * MARGIN_CELLS
+GRID_H = round(GRID_SIZE_Y_M / CELL_SIZE_M) + 2 * MARGIN_CELLS
+X_ZERO = Y_ZERO = MARGIN_CELLS
 BAUD_RATE = 115200
 
-# --- Cell values, matching the MapCell enum ---
-CELL_UNKNOWN  = -1
-CELL_FREE     = 0
-CELL_OBSTACLE = 1
-CELL_ROBOT    = 2
-CELL_WEIGHT   = 3
-
-# Colours, indexed in the same order as the sorted cell values above
-# (-1, 0, 1, 2, 3) -> (unknown, free, obstacle, robot, weight)
-CELL_COLORS = [
-    "#808080",  # unknown       - gray
-    "#E6F0FA",  # free          - off-white blue
-    "#DC143C",  # obstacle/wall - crimson
-    "#32CD32",  # robot cell    - lime green
-    "#DAA520",  # weight        - goldish
-]
-POSE_COLOR = "#145A14"    # dark green
-TARGET_COLOR = "#FF8C00"  # orange
-
-CELL_VALUES = [CELL_UNKNOWN, CELL_FREE, CELL_OBSTACLE, CELL_ROBOT, CELL_WEIGHT]
-
-# Matches StateMachine's enum order in state_machine.h
+CELL_BORDER, CELL_UNKNOWN, CELL_FREE = -2, -1, 0
+CELL_OBSTACLE, CELL_ROBOT, CELL_WEIGHT = 1, 2, 3
+CELL_VALUES = [-2, -1, 0, 1, 2, 3]
+CELL_COLORS = ["black", "grey", "grey", "red", "grey", "gold"]
 STATE_NAMES = ["NAVIGATION", "APPROACH_VERIFY", "APPROACH_WEIGHT",
                "SCANNING", "RETURN_HOME", "DROP_OFF"]
-
-# Matches optional lines like "[pose] ... x=1.234 y=-0.567 theta_deg=12.3"
-# as a fallback if you're not printing a dedicated P, line yet.
+NUMBER = r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
 POSE_DEBUG_RE = re.compile(
-    r"x=\s*(-?\d+\.?\d*).*?y=\s*(-?\d+\.?\d*).*?theta_deg=\s*(-?\d+\.?\d*)"
+    r"\bx=\s*" + NUMBER + r"\s+y=\s*" + NUMBER + r"\s+theta_deg=\s*" + NUMBER
 )
+SERIAL_ERRORS = (serial.SerialException, OSError)
 
 
 def grid_to_world(gx, gy):
-    x_m = (gx - X_ZERO) * CELL_SIZE_M
-    y_m = (gy - Y_ZERO) * CELL_SIZE_M
-    return x_m, y_m
+    return (gx - X_ZERO) * CELL_SIZE_M, (gy - Y_ZERO) * CELL_SIZE_M
 
 
 class Visualiser:
-    def __init__(self, port):
-        self.ser = serial.Serial(port, BAUD_RATE, timeout=0)
-        self.grid = np.full((GRID_H, GRID_W), CELL_UNKNOWN, dtype=int)
-        self.pose = None    # (x_m, y_m, theta_rad or None)
-        self.target = None  # (x_m, y_m)
-        self.motors = None  # (left_pct, right_pct)
-        self.state_info = None   # (state_int, busy_int)
-        self.diag = None    # raw text of the last D, line
+    def __init__(self, port, reset=True, debug=False):
+        self.port = port
+        self.debug = debug
+        self.ser = None
+        self.reset_pending = reset
+        self.next_connect = 0.0
+        self.last_rx = None
+        self.connected_at = None
+        self.status = f"Connecting to {port}"
+        self.last_message = ""
+        self.last_error = ""
+        self.closed = False
         self._buf = ""
+        self.anim = None
+        self.grid = np.full((GRID_H, GRID_W), CELL_UNKNOWN, dtype=int)
+        self.scores = np.zeros((GRID_H, GRID_W), dtype=int)
+        self._clear_state()
 
+        self.fig, self.ax = plt.subplots(figsize=(12, 7))
+        self.fig.subplots_adjust(bottom=0.18)
         cmap = ListedColormap(CELL_COLORS)
-        bounds = [v - 0.5 for v in CELL_VALUES] + [CELL_VALUES[-1] + 0.5]
-        norm = BoundaryNorm(bounds, cmap.N)
-
-        # Cell edges in world coordinates, for pcolormesh (needs edges, not
-        # centres) - one more edge than there are cells in each direction.
-        x_edges = np.array([grid_to_world(gx, 0)[0] for gx in range(GRID_W + 1)])
-        y_edges = np.array([grid_to_world(0, gy)[1] for gy in range(GRID_H + 1)])
-
-        self.fig, self.ax = plt.subplots(figsize=(8, 8))
+        norm = BoundaryNorm(np.arange(-2.5, 4.0, 1.0), cmap.N)
+        # Firmware coordinates name cell centres.
+        x_edges = (np.arange(GRID_W + 1) - X_ZERO - 0.5) * CELL_SIZE_M
+        y_edges = (np.arange(GRID_H + 1) - Y_ZERO - 0.5) * CELL_SIZE_M
         self.mesh = self.ax.pcolormesh(
             x_edges, y_edges, self.grid, cmap=cmap, norm=norm,
-            edgecolors="black", linewidth=0.4,
+            edgecolors="black", linewidth=0.4, shading="flat",
         )
         self.ax.set_aspect("equal")
-        self.pose_dot, = self.ax.plot([], [], "o", color=POSE_COLOR,
-                                       markersize=4, label="pose")
-        self.target_dot, = self.ax.plot([], [], "o", color=TARGET_COLOR,
-                                         markersize=10, label="target")
         self.ax.set_xlabel("x (m)")
         self.ax.set_ylabel("y (m)")
-        self.ax.set_title("Occupancy grid")
-        self.ax.legend(loc="upper right")
-
+        self.ax.set_title("Grid classifications")
+        self.pose_dot, = self.ax.plot([], [], "o", color="#145A14",
+                                      markersize=4, label="pose")
+        self.target_dot, = self.ax.plot([], [], "o", color="#FF8C00",
+                                        markersize=10, label="target")
+        self.ax.legend(handles=[
+            Patch(facecolor="black", label="border"),
+            Patch(facecolor="grey", label="free / unconfirmed"),
+            Patch(facecolor="red", label="wall"),
+            Patch(facecolor="gold", label="weight"),
+            self.pose_dot, self.target_dot,
+        ], loc="upper right")
         self.info_text = self.ax.text(
-            0.02, 0.98, "", transform=self.ax.transAxes,
-            verticalalignment="top", fontsize=9, family="monospace",
+            0.02, 0.98, "", transform=self.ax.transAxes, va="top",
+            fontsize=9, family="monospace",
             bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
         )
+        self.connection_text = self.fig.text(0.08, 0.025, "", fontsize=9)
+        self.fig.canvas.mpl_connect("close_event", self.close)
+
+    def _clear_state(self):
+        self.grid.fill(CELL_FREE)
+        self.scores.fill(0)
+        self.scores[0, :] = self.scores[-1, :] = -101
+        self.scores[:, 0] = self.scores[:, -1] = -101
+        self.grid[0, :] = self.grid[-1, :] = CELL_BORDER
+        self.grid[:, 0] = self.grid[:, -1] = CELL_BORDER
+        self.pose = self.target = self.motors = self.state_info = None
+        self.diag = None
+        self.cell_updates = self.telemetry_count = self.bad_lines = 0
+
+    def _close_port(self):
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except SERIAL_ERRORS:
+                pass
+        self.ser = None
+
+    def _disconnect(self, exc):
+        self._close_port()
+        self._buf = ""  # Never join fragments from separate connections.
+        self.status = f"Disconnected from {self.port}; retrying"
+        message = str(exc)
+        if message != self.last_error:
+            print(f"{self.status}: {message}", flush=True)
+        self.last_error = message
+        self.next_connect = time.monotonic() + 0.5
+
+    def _connect(self):
+        if time.monotonic() < self.next_connect:
+            return False
+        try:
+            self.ser = serial.Serial(
+                self.port, BAUD_RATE, timeout=0, write_timeout=0.5
+            )
+            self.connected_at = time.monotonic()
+            self.last_rx = None
+            self.last_error = ""
+            self.status = f"Connected to {self.port}; waiting for data"
+            print(self.status, flush=True)
+            if self.reset_pending:
+                # Discard OLD data only, before requesting restart.
+                self.ser.reset_input_buffer()
+                self._buf = ""
+                self._clear_state()
+                # Consume the request BEFORE writing: a write error may mean
+                # the device already reset. Retrying R could cause a loop.
+                self.reset_pending = False
+                self.status = "Restart requested; waiting for robot / USB"
+                print(self.status, flush=True)
+                if self.ser.write(b"R") != 1:
+                    raise serial.SerialException("Restart byte was not written")
+                # No flush is needed here; subsequent read errors also trigger
+                # reconnection if the board resets immediately after write.
+            return True
+        except SERIAL_ERRORS as exc:
+            self._disconnect(exc)
+            return False
 
     def _handle_line(self, line):
-        parts = line.strip().split(",")
-        if not parts or not parts[0]:
+        line = line.strip()
+        if not line:
             return
-
+        if self.debug:
+            print(line, flush=True)
+        if line == "=== BOOT ===":
+            self._clear_state()
+            self.last_message = line
+            return
+        parts = line.split(",")
         tag = parts[0]
         try:
-            if tag == "C" and len(parts) == 4:
-                gx, gy, value = int(parts[1]), int(parts[2]), int(parts[3])
-                if 0 <= gx < GRID_W and 0 <= gy < GRID_H:
-                    self.grid[gy, gx] = value
-
-            elif tag == "P" and len(parts) == 4:
-                self.pose = (float(parts[1]), float(parts[2]), float(parts[3]))
-
-            elif tag == "T" and len(parts) == 3:
-                self.target = (float(parts[1]), float(parts[2]))
-
+            if tag == "Q" and len(parts) == 5:
+                gx, gy, score, label = map(int, parts[1:])
+                if not (0 <= gx < GRID_W and 0 <= gy < GRID_H and -101 <= score <= 100
+                        and label in (CELL_BORDER, CELL_FREE, CELL_OBSTACLE, CELL_WEIGHT)
+                        and (score == -101) == (label == CELL_BORDER)):
+                    raise ValueError("invalid confidence cell")
+                self.scores[gy, gx] = score
+                self.grid[gy, gx] = label
+                self.cell_updates += 1
+            elif tag == "C" and len(parts) == 4:
+                gx, gy, value = map(int, parts[1:])
+                if not (0 <= gx < GRID_W and 0 <= gy < GRID_H
+                        and value in CELL_VALUES):
+                    raise ValueError("invalid cell")
+                self.grid[gy, gx] = value
+                self.scores[gy, gx] = {CELL_BORDER: -101, CELL_OBSTACLE: -100, CELL_WEIGHT: 100}.get(value, 0)
+                self.cell_updates += 1
+            elif tag in ("P", "T") and len(parts) == (4 if tag == "P" else 3):
+                values = tuple(map(float, parts[1:]))
+                if not all(np.isfinite(values)):
+                    raise ValueError("non-finite coordinates")
+                if tag == "P":
+                    self.pose = values
+                else:
+                    self.target = values
             elif tag == "M" and len(parts) == 3:
-                self.motors = (int(parts[1]), int(parts[2]))
-
+                self.motors = tuple(map(int, parts[1:]))
             elif tag == "S" and len(parts) == 3:
-                self.state_info = (int(parts[1]), int(parts[2]))
-
+                self.state_info = tuple(map(int, parts[1:]))
             elif tag == "D":
-                self.diag = line.strip()[2:]   # drop the "D," prefix
-
+                self.diag = line[2:]
             else:
-                m = POSE_DEBUG_RE.search(line)
-                if m:
-                    x, y, theta_deg = map(float, m.groups())
+                match = POSE_DEBUG_RE.search(line)
+                if match:
+                    x, y, theta_deg = map(float, match.groups())
                     self.pose = (x, y, np.radians(theta_deg))
-
-        except ValueError:
-            pass  # malformed/partial line, just skip it
+                else:
+                    self.last_message = line[:160]
+                    return
+            self.telemetry_count += 1
+        except (ValueError, OverflowError):
+            self.bad_lines += 1
 
     def _read_serial(self):
-        n = self.ser.in_waiting
-        if n:
-            self._buf += self.ser.read(n).decode(errors="replace")
-        while "\n" in self._buf:
+        if self.ser is None and not self._connect():
+            return
+        try:
+            # Limit work per animation frame so a busy stream cannot freeze UI.
+            n = min(self.ser.in_waiting, 65536)
+            if n:
+                data = self.ser.read(n)
+                if data:
+                    self.last_rx = time.monotonic()
+                    self.status = f"Receiving from {self.port}"
+                    self._buf += data.decode("utf-8", errors="replace")
+        except SERIAL_ERRORS as exc:
+            self._disconnect(exc)
+            return
+        for _ in range(2000):
+            if "\n" not in self._buf:
+                break
             line, self._buf = self._buf.split("\n", 1)
             self._handle_line(line)
+        if len(self._buf) > 262144:
+            self._buf = ""
+            self.last_message = "Serial backlog/unterminated data discarded"
 
     def update(self, _frame):
+        if self.closed:
+            return ()
         self._read_serial()
-
         self.mesh.set_array(self.grid.ravel())
-
-        if self.pose is not None:
-            self.pose_dot.set_data([self.pose[0]], [self.pose[1]])
-        if self.target is not None:
-            self.target_dot.set_data([self.target[0]], [self.target[1]])
-
+        for dot, position in ((self.pose_dot, self.pose),
+                              (self.target_dot, self.target)):
+            dot.set_data([position[0]], [position[1]]) if position is not None else dot.set_data([], [])
         lines = []
         if self.motors is not None:
             lines.append(f"motors: L={self.motors[0]:>4} R={self.motors[1]:>4}")
         if self.state_info is not None:
-            state_num, busy = self.state_info
-            name = STATE_NAMES[state_num] if 0 <= state_num < len(STATE_NAMES) else f"?{state_num}"
-            lines.append(f"state:  {name}  busy={bool(busy)}")
+            state, busy = self.state_info
+            name = STATE_NAMES[state] if 0 <= state < len(STATE_NAMES) else f"?{state}"
+            lines.append(f"state: {name}  busy={bool(busy)}")
         if self.diag is not None:
             lines.append(f"sensors: {self.diag}")
         self.info_text.set_text("\n".join(lines))
+        status = self.status
+        if self.ser is not None:
+            since = self.last_rx if self.last_rx is not None else self.connected_at
+            age = time.monotonic() - since
+            if age > 3:
+                status += f" | No incoming data for {age:.1f}s"
+        self.connection_text.set_text(
+            f"{status}\nTelemetry: {self.telemetry_count} | Cell updates: "
+            f"{self.cell_updates} | Invalid records: {self.bad_lines}\n"
+            f"Robot: {self.last_message}"
+        )
+        return self.mesh, self.pose_dot, self.target_dot, self.info_text, self.connection_text
 
-        return self.mesh, self.pose_dot, self.target_dot, self.info_text
+    def close(self, _event=None):
+        self.closed = True
+        if self.anim is not None and self.anim.event_source is not None:
+            self.anim.event_source.stop()
+        self._close_port()
 
     def run(self):
-        anim = FuncAnimation(self.fig, self.update, interval=100, blit=False)
-        plt.show()
+        self.anim = FuncAnimation(
+            self.fig, self.update, interval=100, blit=False,
+            cache_frame_data=False,
+        )
+        try:
+            plt.show()
+        finally:
+            self.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("port", help="Serial port, e.g. COM5 or /dev/ttyACM0")
+    parser.add_argument("--no-reset", action="store_true", help="Connect without sending R")
+    parser.add_argument("--debug", action="store_true", help="Print all received lines")
+    args = parser.parse_args()
+    Visualiser(args.port, reset=not args.no_reset, debug=args.debug).run()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <serial-port>")
-        print("  e.g. python visualiser.py COM5")
-        print("       python visualiser.py /dev/ttyACM0")
-        sys.exit(1)
-
-    Visualiser(sys.argv[1]).run()
+    main()

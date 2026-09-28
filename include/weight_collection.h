@@ -6,10 +6,10 @@
 // every loop. Nothing here uses delay(), so the main loop keeps running fast.
 //
 // Behaviour:
-//  - IR proximity + induction both detect  -> run the crane pickup sequence.
-//  - IR proximity only                     -> wait up to 5s for induction;
+//  - Induction detects (regardless of IR)  -> run the crane pickup sequence.
+//  - IR proximity only                     -> feed forward up to 5s for induction;
 //                                             if it never detects, swing the clearing arm.
-//  - After 3 pickups, once the crane is back at idle -> swing the release arm.
+//  - After 3 pickups, release when requested at home with the crane at idle.
 //  - Release/clearing arms never move while the magnets are on or the crane is busy.
 //  - Crane sits at idle (50 deg) when not picking up.
 
@@ -24,8 +24,12 @@ enum WeightState {
 void weight_collection_init();
 void weight_collection_update();
 
-// True whenever the robot should hold still (waiting, picking up, or moving an arm).
+// True whenever collection owns driving (feeding, picking up, or moving an arm).
+// Hold still unless weight_collection_feeding() is true.
 bool weight_collection_busy();
+
+// Drive forward while waiting for induction, until the timeout expires.
+bool weight_collection_feeding();
 
 WeightState weight_collection_state();
 int weight_collection_count();   // pickups since the last release

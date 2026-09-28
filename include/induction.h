@@ -2,7 +2,7 @@
 #define INDUCTION_H
 
 #define INDUCTION_PIN 20
-#define INDUCTION_THRESHOLD 500
+#define INDUCTION_THRESHOLD 200
 
 void induction_init();
 bool induction_detected();
