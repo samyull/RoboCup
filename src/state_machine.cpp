@@ -15,6 +15,9 @@ static const bool USE_FRONTIER_NAV = true;
 static const uint32_t WEIGHT_LOST_TIMEOUT_MS = 2500;   // legacy: no fresh sighting -> scan
 static const int WEIGHTS_BEFORE_HOME = 3;
 static const uint32_t EARLY_HOME_MS = 90000;           // from 90 s, any weight on board -> home
+// After the home colour wasn't found with a part load, keep exploring at least
+// this long before an early/partial return home is allowed again.
+static const uint32_t HOME_RETRY_COOLDOWN_MS = 15000;
 
 static const int   APPROACH_SPEED_PCT = 75;   // TODO: find the sweet spot on the bench
 static const float APPROACH_TURN_KP   = 40.0f; // gentler than general navigation - funnel forgives error
@@ -87,6 +90,7 @@ static float blind_hold_theta = 0.0f;
 static uint32_t last_plan_ms = 0;
 static bool have_path = false;
 static uint32_t drop_off_start_ms = 0;
+static uint32_t home_retry_after_ms = 0;  // partial-load returns home are held off until this
 
 static bool stuck_tracking = false;
 static float stuck_x = 0.0f, stuck_y = 0.0f;
@@ -186,9 +190,17 @@ static void apply_reflex(const TofReading ranges[TOF_TOTAL_COUNT], int &left_pct
 }
 
 // True (and starts a short reverse) when driving forward has not moved the
-// robot STUCK_MIN_MOVE_M in STUCK_WINDOW_MS.
+// robot STUCK_MIN_MOVE_M in STUCK_WINDOW_MS, or path following has been held
+// still by a blocked line for STUCK_WINDOW_MS.
 static bool check_stuck(const Pose &pose, int left_pct, int right_pct) {
   const uint32_t now = millis();
+  if (planner_blocked_ms() >= STUCK_WINDOW_MS) {
+    planner_clear_path();  // also resets the blocked timer
+    stuck_tracking = false;
+    reverse_until_ms = now + STUCK_REVERSE_MS;
+    Serial.println("Path blocked - reversing and replanning");
+    return true;
+  }
   if (left_pct <= 0 || right_pct <= 0) {
     stuck_tracking = false;
     return false;
@@ -213,6 +225,8 @@ static bool choose_weight(Target &out) {
   for (int gy = 0; gy < MAP_GRID_H; ++gy)
     for (int gx = 0; gx < MAP_GRID_W; ++gx) {
       if (map_get_cell(gx, gy) != MAP_CELL_WEIGHT) continue;
+      // Too close to a wall or the border to collect: never a target.
+      if (!planner_cell_open(gx, gy)) continue;
       if (planner_cost(gx, gy) == PLAN_UNREACHABLE) continue;
       float x, y;
       grid_to_world(gx, gy, x, y);
@@ -266,6 +280,7 @@ void state_machine_init() {
   waypoint_index = 0;
   round_start_ms = millis();
   for (auto &s : weight_skips) s = {0.0f, 0.0f, round_start_ms};
+  home_retry_after_ms = round_start_ms;
   stuck_tracking = false;
   reverse_until_ms = round_start_ms;
   planner_clear_path();
@@ -337,7 +352,8 @@ static void run_go_to_weight(const Pose &pose, const TofReading ranges[TOF_TOTAL
   if (now - last_plan_ms >= REPLAN_MS) {
     last_plan_ms = now;
     planner_plan(pose, PLAN_ALLOW_UNSEEN);
-    have_path = planner_set_goal(gx, gy);
+    // A wall mapped since choosing it can put the weight inside the wall margin.
+    have_path = planner_cell_open(gx, gy) && planner_set_goal(gx, gy);
     if (!have_path) {
       skip_weight(locked_target);
       resume_search();
@@ -381,7 +397,7 @@ static void run_scan_continuous(const Pose &pose, int &left_pct, int &right_pct)
     FrontierGoal goal;
     if (exploration_choose_frontier(pose, goal)) {
       resume_search();
-    } else if (weight_collection_count() > 0) {
+    } else if (weight_collection_count() > 0 && (int32_t)(now - home_retry_after_ms) >= 0) {
       begin_return_home("nothing left to explore");
     } else {
       exploration_reset();  // everything seen and nothing found: go round again
@@ -636,11 +652,25 @@ static void run_approach_blind(const Pose &pose, int &left_pct, int &right_pct) 
 
 static void run_return_home(const Pose &pose, const TofReading ranges[TOF_TOTAL_COUNT],
                              int &left_pct, int &right_pct) {
-  if (return_home_update(pose, left_pct, right_pct)) {
+  const HomeStatus status = return_home_update(pose, left_pct, right_pct);
+  if (status == HOME_ARRIVED) {
     weight_collection_request_release();
     drop_off_start_ms = millis();
     current_state = DROP_OFF;
     left_pct = right_pct = 0;
+    return;
+  }
+  if (status == HOME_COLOR_NOT_FOUND) {
+    left_pct = right_pct = 0;
+    if (weight_collection_count() >= WEIGHTS_BEFORE_HOME) {
+      // Full: nothing else to do, so drive round home until the base is found.
+      return_home_search();
+    } else {
+      // Part load: more to gain from collecting than from hunting for the base.
+      Serial.println("Home colour not found - back to exploring");
+      home_retry_after_ms = millis() + HOME_RETRY_COOLDOWN_MS;
+      resume_search();
+    }
     return;
   }
   apply_reflex(ranges, left_pct, right_pct);
@@ -657,7 +687,8 @@ void state_machine_update(const Pose &pose, const TofReading ranges[TOF_TOTAL_CO
   if (current_state != RETURN_HOME && current_state != DROP_OFF) {
     const int on_board = weight_collection_count();
     if (on_board >= WEIGHTS_BEFORE_HOME) begin_return_home("full");
-    else if (on_board > 0 && now - round_start_ms >= EARLY_HOME_MS) begin_return_home("90 s with a weight on board");
+    else if (on_board > 0 && now - round_start_ms >= EARLY_HOME_MS &&
+             (int32_t)(now - home_retry_after_ms) >= 0) begin_return_home("90 s with a weight on board");
   }
 
   out_left_pct = 0;

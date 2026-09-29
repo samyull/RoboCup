@@ -7,7 +7,11 @@
 static const float    ROBOT_HALF_WIDTH_M  = 0.155f;
 static const uint16_t STEP_COST           = 10;   // per 5 cm straight
 static const uint16_t DIAG_COST           = 14;
-static const uint16_t BAND_ESCAPE_PENALTY = 200;  // leaving the border band after drifting into it
+// Robot centre is kept at least this far from a mapped obstacle cell's centre.
+// Also decides which weights are reachable: a weight closer than this to a
+// wall is never chosen (the funnel can't collect it there anyway).
+static const float    OBSTACLE_CLEARANCE_M = ROBOT_HALF_WIDTH_M;
+static const uint16_t BAND_ESCAPE_PENALTY = 200;  // per keep-out cell when escaping one (band or margin)
 static const float    WAYPOINT_REACHED_M  = 0.12f;
 static const int      MAX_PATH_CELLS      = 600;
 static const int      MAX_WAYPOINTS       = 48;
@@ -15,6 +19,7 @@ static const int      MAX_WAYPOINTS       = 48;
 enum CellClass : uint8_t {
   CELL_OPEN,       // free to drive
   CELL_BAND,       // within a half-width of the arena border: never entered, except to escape it
+  CELL_MARGIN,     // within OBSTACLE_CLEARANCE_M of a mapped obstacle: same rule as the band
   CELL_BLOCKED,    // wall, border, or (going home) unseen
 };
 
@@ -78,6 +83,11 @@ static bool in_grid(int gx, int gy) {
   return gx >= 0 && gx < MAP_GRID_W && gy >= 0 && gy < MAP_GRID_H;
 }
 
+// Cells the robot never enters, except to drive out of after ending up in one.
+static bool keep_out(uint8_t c) {
+  return c == CELL_BAND || c == CELL_MARGIN;
+}
+
 static void classify_cells(PlanMode mode) {
   for (int gy = 0; gy < MAP_GRID_H; ++gy)
     for (int gx = 0; gx < MAP_GRID_W; ++gx) {
@@ -91,9 +101,8 @@ static void classify_cells(PlanMode mode) {
       else if (mode == PLAN_SEEN_ONLY && !exploration_fine_seen(gx, gy)) c = CELL_BLOCKED;
       cell_class[gy][gx] = c;
     }
-  // Inflate occupied cell areas, not just their centres. A circumscribed
-  // half-cell diagonal conservatively covers the entire occupied square.
-  const float clearance = ROBOT_HALF_WIDTH_M + MAP_CELL_SIZE_M * 0.707107f;
+  // Keep-out margin around mapped obstacles (the border has the band instead).
+  const float clearance = OBSTACLE_CLEARANCE_M;
   const int r = (int)ceilf(clearance / MAP_CELL_SIZE_M);
   for (int gy = 0; gy < MAP_GRID_H; ++gy)
     for (int gx = 0; gx < MAP_GRID_W; ++gx) {
@@ -102,7 +111,7 @@ static void classify_cells(PlanMode mode) {
         for (int dx = -r; dx <= r; ++dx) {
           if ((dx * dx + dy * dy) * MAP_CELL_SIZE_M * MAP_CELL_SIZE_M > clearance * clearance) continue;
           const int nx = gx + dx, ny = gy + dy;
-          if (in_grid(nx, ny)) cell_class[ny][nx] = CELL_BLOCKED;
+          if (in_grid(nx, ny) && cell_class[ny][nx] == CELL_OPEN) cell_class[ny][nx] = CELL_MARGIN;
         }
     }
 }
@@ -113,8 +122,9 @@ void planner_plan(const Pose &pose, PlanMode mode) {
   world_to_grid(pose.x, pose.y, sgx, sgy);
   sgx = constrain(sgx, 0, MAP_GRID_W - 1);
   sgy = constrain(sgy, 0, MAP_GRID_H - 1);
-  // Drifted into the border band: allow driving through it, at a cost, to get out.
-  const bool escape = cell_class[sgy][sgx] == CELL_BAND;
+  // Started in a keep-out cell (drifted into the band, pushed near a wall, or a
+  // wall got mapped under the robot): allow keep-out cells, at a cost, to get out.
+  const bool escape = cell_class[sgy][sgx] != CELL_OPEN;
 
   for (int gy = 0; gy < MAP_GRID_H; ++gy)
     for (int gx = 0; gx < MAP_GRID_W; ++gx) {
@@ -124,10 +134,8 @@ void planner_plan(const Pose &pose, PlanMode mode) {
   for (int i = 0; i < N_CELLS; ++i) heap_pos[i] = -1;
   heap_size = 0;
 
-  have_plan = true;
-  // Never seed a route inside a mapped obstacle or its footprint margin.
-  if (cell_class[sgy][sgx] == CELL_BLOCKED) return;
-
+  // Always seed from the robot's own cell, whatever it is, so the robot can
+  // plan its way out rather than stalling.
   dist[sgy][sgx] = 0;
   heap_push_or_decrease(sgy * MAP_GRID_W + sgx);
   while (heap_size > 0) {
@@ -139,12 +147,12 @@ void planner_plan(const Pose &pose, PlanMode mode) {
         const int vx = ux + dx, vy = uy + dy;
         if (!in_grid(vx, vy)) continue;
         const uint8_t c = cell_class[vy][vx];
-        if (c == CELL_BLOCKED || (c == CELL_BAND && !escape)) continue;
+        if (c == CELL_BLOCKED || (keep_out(c) && !escape)) continue;
         // No cutting diagonally past a blocked corner.
         if (dx && dy && (cell_class[uy][vx] == CELL_BLOCKED || cell_class[vy][ux] == CELL_BLOCKED ||
-            (!escape && (cell_class[uy][vx] == CELL_BAND || cell_class[vy][ux] == CELL_BAND)))) continue;
+            (!escape && (keep_out(cell_class[uy][vx]) || keep_out(cell_class[vy][ux]))))) continue;
         uint32_t step = (dx && dy) ? DIAG_COST : STEP_COST;
-        if (c == CELL_BAND) step += BAND_ESCAPE_PENALTY;
+        if (keep_out(c)) step += BAND_ESCAPE_PENALTY;
         const uint32_t nd = (uint32_t)dist[uy][ux] + step;
         if (nd >= PLAN_UNREACHABLE || nd >= dist[vy][vx]) continue;
         dist[vy][vx] = (uint16_t)nd;
@@ -172,15 +180,17 @@ static int waypoint_count = 0;
 static int waypoint_index = 0;
 static float path_start_x = 0.0f, path_start_y = 0.0f;
 
-// Check endpoints and both side cells on a diagonal step. Border-band routes
-// may leave the band, but shortcuts may not enter it from open ground.
+// Check the end cell, every cell on the line and both side cells on a diagonal
+// step. A line starting in a keep-out cell may cross keep-out cells to get out,
+// but shortcuts may not enter them from open ground. The start cell itself is
+// not checked, so the robot can always drive out of wherever it is.
 static bool cells_clear(int x0, int y0, int x1, int y1) {
   if (!in_grid(x0, y0) || !in_grid(x1, y1)) return false;
-  const bool escape = cell_class[y0][x0] == CELL_BAND;
+  const bool escape = cell_class[y0][x0] != CELL_OPEN;
   auto passable = [escape](int x, int y) {
-    return cell_class[y][x] == CELL_OPEN || (escape && cell_class[y][x] == CELL_BAND);
+    return cell_class[y][x] == CELL_OPEN || (escape && keep_out(cell_class[y][x]));
   };
-  if (!passable(x0, y0) || !passable(x1, y1)) return false;
+  if (!passable(x1, y1)) return false;
   int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
   int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
   int err = dx + dy;
@@ -246,13 +256,23 @@ bool planner_set_goal(int gx, int gy) {
   return true;
 }
 
+// planner_follow() holding still because its straight line is blocked.
+static bool follow_blocked = false;
+static uint32_t follow_blocked_since_ms = 0;
+static uint32_t last_follow_ms = 0;
+
 void planner_clear_path() {
   waypoint_count = 0;
   waypoint_index = 0;
+  follow_blocked = false;
 }
 
 bool planner_follow(const Pose &pose, float arrive_m, int &left_pct, int &right_pct) {
   left_pct = right_pct = 0;
+  const uint32_t now = millis();
+  // A gap in calls means a different state was running: start the blocked count afresh.
+  if (now - last_follow_ms > 200) follow_blocked = false;
+  last_follow_ms = now;
   if (waypoint_count == 0) return false;
   while (waypoint_index < waypoint_count - 1 &&
          distance_to(pose, waypoints[waypoint_index]) < WAYPOINT_REACHED_M &&
@@ -261,9 +281,24 @@ bool planner_follow(const Pose &pose, float arrive_m, int &left_pct, int &right_
   if (waypoint_index == waypoint_count - 1 && distance_to(pose, waypoints[waypoint_index]) <= arrive_m) {
     return true;
   }
-  if (planner_straight_clear(pose.x, pose.y, waypoints[waypoint_index].x, waypoints[waypoint_index].y))
+  if (planner_straight_clear(pose.x, pose.y, waypoints[waypoint_index].x, waypoints[waypoint_index].y)) {
     navigate_to_target(pose, waypoints[waypoint_index], left_pct, right_pct);
+    follow_blocked = false;
+  } else if (!follow_blocked) {
+    // Held still; the next replan usually finds a new route from here.
+    follow_blocked = true;
+    follow_blocked_since_ms = now;
+  }
   return false;
+}
+
+uint32_t planner_blocked_ms() {
+  if (!follow_blocked || millis() - last_follow_ms > 200) return 0;
+  return millis() - follow_blocked_since_ms;
+}
+
+bool planner_cell_open(int gx, int gy) {
+  return have_plan && in_grid(gx, gy) && cell_class[gy][gx] == CELL_OPEN;
 }
 
 bool planner_straight_clear(float x0, float y0, float x1, float y1) {
