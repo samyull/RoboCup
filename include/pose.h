@@ -108,6 +108,18 @@ void pose_set_heading(float theta_rad);
 
 float angular_speed_rad_s();
 
+// Stopped filter: while both motors are commanded to 0 (after a short roll-on
+// grace period) flow is ignored, since the robot can't be moving - this removes
+// phantom motion, e.g. the flow sensor "drifting" on the coloured home square.
+// On by default; the P bench test (hand push, motors off) turns it off.
+void pose_set_stationary_filter(bool enabled);
+
+// Flow blind: x/y stop following the flow sensor (heading still updates). The
+// displacement it would have applied is kept; pass apply_skipped when ending the
+// blind to add it back (the best guess when no better position fix is available).
+void pose_set_flow_blind(bool blind, bool apply_skipped = false);
+bool pose_flow_blind();
+
 #include "bench_config.h"
 #if ENABLE_BENCH_TESTS
 // Snapshot of the last pose_update(), without another sensor read.
@@ -116,6 +128,13 @@ struct FlowDiagnostic {
   bool read = false, integrated = false;
   float sensor_forward_m = 0, sensor_left_m = 0;
   float correction_forward_m = 0, correction_left_m = 0;
+  // Tracking quality, read from the PMW3901 right after the motion read.
+  // squal: surface quality (features seen) - higher is better, falls when
+  //   tracking is marginal (blur, poor texture, too far from the floor).
+  // shutter: exposure time - higher means darker; long exposures blur at speed.
+  bool quality_read = false;
+  uint8_t squal = 0;
+  uint16_t shutter = 0;
 };
 FlowDiagnostic pose_flow_diagnostic();
 #endif

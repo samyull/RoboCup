@@ -49,7 +49,7 @@ static const uint32_t DROP_OFF_TIMEOUT_MS  = 3000;    // release should start we
 static const uint32_t STUCK_WINDOW_MS  = 3000;
 static const float    STUCK_MIN_MOVE_M = 0.05f;
 static const uint32_t STUCK_REVERSE_MS = 500;
-static const int      STUCK_REVERSE_PCT = 60;
+static const int      STUCK_REVERSE_PCT = 65;
 
 // SCANNING. Frontier mode: one continuous turn (the ToF pose history keeps
 // mapping valid while turning). Legacy: stop-and-sample steps.

@@ -6,8 +6,13 @@
 #include "weight_collection.h"
 #include <Arduino.h>
 
-static const int POWER_PCT = 60;
+static const int POWER_PCT = 70;  // above the 65% minimum so the test drive does not stall
+// Target by the robot's own pose, including the roll-on after the motors cut:
+// they stop COAST_M early so the robot comes to rest at DRIVE_M. COAST_M is the
+// measured final roll-on at 70% power (14-19 mm earlier runs, 25 mm last run) -
+// update it from forward_mm - stop_forward_mm if POWER_PCT changes.
 static const float DRIVE_M = 0.5f;
+static const float COAST_M = 0.022f;
 static const uint32_t TIMEOUT_MS = 15000;
 static const uint32_t SETTLE_MS = 700;
 
@@ -18,6 +23,35 @@ static float wrap(float a) {
 }
 
 // Consume commands during the test so a queued G cannot start a round later.
+// Tracking quality over the samples taken while moving (see FlowDiagnostic).
+struct QualityStats {
+  uint32_t n = 0;
+  uint32_t squal_sum = 0, shutter_sum = 0;
+  uint8_t squal_min = 255;
+  uint16_t shutter_max = 0;
+  void add(const FlowDiagnostic &d) {
+    if (!d.quality_read) return;
+    ++n;
+    squal_sum += d.squal;
+    shutter_sum += d.shutter;
+    squal_min = min(squal_min, d.squal);
+    shutter_max = max(shutter_max, d.shutter);
+  }
+  void print() const {
+    Serial.print(",quality_samples="); Serial.print(n);
+    if (!n) return;
+    Serial.print(",squal_min="); Serial.print(squal_min);
+    Serial.print(",squal_avg="); Serial.print((float)squal_sum / n, 1);
+    Serial.print(",shutter_avg="); Serial.print((float)shutter_sum / n, 0);
+    Serial.print(",shutter_max="); Serial.print(shutter_max);
+  }
+};
+
+static void print_quality_now(const FlowDiagnostic &d) {
+  Serial.print(",squal="); Serial.print(d.squal);
+  Serial.print(",shutter="); Serial.print(d.shutter);
+}
+
 static bool stop_requested() {
   bool stop = false;
   while (Serial.available()) {
@@ -38,6 +72,8 @@ static bool run_leg(int direction) {
   }
   const Pose origin = p;
   Pose previous = p;
+  const FlowDiagnostic at_rest = pose_flow_diagnostic();
+  QualityStats moving;
   float turned = 0, peak = 0, path = 0, max_heading_error = 0;
   const uint32_t start = millis();
   uint32_t last_print = start, stopped_at = 0;
@@ -47,11 +83,14 @@ static bool run_leg(int direction) {
   Serial.print("FLOW_BEGIN,test="); Serial.print(name);
   Serial.print(",meters_per_count="); Serial.print(FLOW_METERS_PER_COUNT, 9);
   Serial.print(",power_pct="); Serial.print(POWER_PCT);
-  Serial.println(",target_mm=500,turn_target_deg=360");
+  Serial.print(",target_mm="); Serial.print(DRIVE_M * 1000, 0);
+  Serial.println(",turn_target_deg=360");
 
   while (true) {
     const bool abort = stop_requested();
     p = pose_update();
+    const FlowDiagnostic d = pose_flow_diagnostic();
+    if (!stopped) moving.add(d);
     const uint32_t now = millis();
     const float dx = p.x - origin.x, dy = p.y - origin.y;
     const float forward = dx * cosf(origin.theta) + dy * sinf(origin.theta);
@@ -68,7 +107,7 @@ static bool run_leg(int direction) {
       if (!stopped) { stopped = true; stopped_at = now; stop_forward = forward; }
     }
     if (!stopped) {
-      const bool reached = direction == 0 ? forward >= DRIVE_M
+      const bool reached = direction == 0 ? forward >= DRIVE_M - COAST_M
                                           : direction * turned >= 2.0f * PI;
       if (reached || now - start >= TIMEOUT_MS) {
         if (!reached) result = "TIMEOUT";
@@ -91,7 +130,9 @@ static bool run_leg(int direction) {
       Serial.print(",t_ms="); Serial.print(now - start);
       Serial.print(",forward_mm="); Serial.print(forward * 1000, 1);
       Serial.print(",left_mm="); Serial.print(lateral * 1000, 1);
-      Serial.print(",turn_deg="); Serial.println(degrees(turned), 1);
+      Serial.print(",turn_deg="); Serial.print(degrees(turned), 1);
+      print_quality_now(d);
+      Serial.println();
     }
     if (stopped && now - stopped_at >= SETTLE_MS) {
       Serial.print("FLOW_SUMMARY,test="); Serial.print(name);
@@ -104,7 +145,11 @@ static bool run_leg(int direction) {
       Serial.print(",peak_displacement_mm="); Serial.print(peak * 1000, 1);
       Serial.print(",pose_path_mm="); Serial.print(path * 1000, 1);
       Serial.print(",turn_deg="); Serial.print(degrees(turned), 1);
-      Serial.print(",max_heading_error_deg="); Serial.println(degrees(max_heading_error), 1);
+      Serial.print(",max_heading_error_deg="); Serial.print(degrees(max_heading_error), 1);
+      Serial.print(",rest_squal="); Serial.print(at_rest.squal);
+      Serial.print(",rest_shutter="); Serial.print(at_rest.shutter);
+      moving.print();  // while driving (before the stop command)
+      Serial.println();
       return result[0] == 'O';
     }
     delay(20);
@@ -113,12 +158,14 @@ static bool run_leg(int direction) {
 
 static void run_manual_push() {
   stop_motors();
+  pose_set_stationary_filter(false);  // motors are off on purpose: count the push
   const Pose origin = pose_update();
   const uint32_t start = millis();
   uint32_t last_print = start, samples = 0, zero_samples = 0, integrated = 0;
   int32_t sum_x = 0, sum_y = 0;
   uint32_t abs_x = 0, abs_y = 0;
   float sensor_fwd = 0, sensor_left = 0, corr_fwd = 0, corr_left = 0;
+  QualityStats moving;  // samples with motion only, so standing still doesn't hide drops
   Serial.print("FLOW_BEGIN,test=PUSH,meters_per_count=");
   Serial.print(FLOW_METERS_PER_COUNT, 9);
   Serial.println(",motors=OFF; push now, stop moving then send X; automatic end at 30 seconds");
@@ -129,6 +176,7 @@ static void run_manual_push() {
     if (d.read) {
       ++samples;
       if (!d.raw_x && !d.raw_y) ++zero_samples;
+      else moving.add(d);
       sum_x += d.raw_x; sum_y += d.raw_y;
       abs_x += abs((int)d.raw_x); abs_y += abs((int)d.raw_y);
     }
@@ -157,11 +205,15 @@ static void run_manual_push() {
       Serial.print(",pose_forward_mm="); Serial.print((dx * cosf(origin.theta) + dy * sinf(origin.theta)) * 1000, 1);
       Serial.print(",pose_left_mm="); Serial.print((-dx * sinf(origin.theta) + dy * cosf(origin.theta)) * 1000, 1);
       Serial.print(",heading_valid="); Serial.print(pose_heading_valid());
-      Serial.print(",heading_change_deg="); Serial.println(degrees(wrap(p.theta - origin.theta)), 1);
+      Serial.print(",heading_change_deg="); Serial.print(degrees(wrap(p.theta - origin.theta)), 1);
+      if (finish) moving.print();
+      else print_quality_now(d);
+      Serial.println();
     }
     if (finish) break;
     delay(20);
   }
+  pose_set_stationary_filter(true);
 }
 
 void flow_test_run(char command) {

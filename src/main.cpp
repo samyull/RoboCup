@@ -15,6 +15,7 @@
 #include "wall_anchor.h"
 #include "ultrasound.h"
 #include "color_sensor.h"
+#include "return_to_base.h"
 #include "bench_config.h"
 #if ENABLE_BENCH_TESTS
 #include "flow_test.h"
@@ -23,7 +24,7 @@
 static const uint8_t FLOW_CHIP_SELECT = 10;
 static TofReading ranges[TOF_TOTAL_COUNT];
 // Matches the current minimum effective motor power; tune on the robot.
-static const int FUNNEL_FEED_SPEED_PCT = 60;
+static const int FUNNEL_FEED_SPEED_PCT = 65;
 
 #if ENABLE_BENCH_TESTS
 static bool testing = true;
@@ -65,7 +66,7 @@ static const char *round_phase_name() {
 // both at once -> full reverse. Lasts US_ESCAPE_MS from the latest trigger.
 // Overrides navigation, but never weight collection or an IMU timeout stop.
 static const uint32_t US_ESCAPE_MS        = 2000;
-static const int      US_ESCAPE_SPEED_PCT = 60;   // minimum effective motor power
+static const int      US_ESCAPE_SPEED_PCT = 65;   // minimum effective motor power
 static uint32_t us_escape_start_ms = 0;
 static bool us_escape_running = false;
 static int us_escape_left_pct = 0, us_escape_right_pct = 0;
@@ -89,6 +90,42 @@ static bool us_escape_active() {
     Serial.println("Ultrasound escape finished");
   }
   return us_escape_running;
+}
+
+// --- Soft start ---
+// The flow sensor tracks poorly on the coloured start square, so the round opens
+// by driving straight off it: SOFT_START_PCT for SOFT_START_MS, holding the start
+// heading with the IMU. Ends early if something is close ahead (normal navigation
+// and its obstacle reflex take over). Weight collection still pre-empts it.
+static const uint32_t SOFT_START_MS  = 2000;
+static const int      SOFT_START_PCT = 80;
+static const float    SOFT_START_TURN_KP = 40.0f;  // % per rad of heading error
+static const int      SOFT_START_MAX_TURN_PCT = 20;
+static bool soft_start_running = false;
+
+static void soft_start_begin() {
+  soft_start_running = true;
+  Serial.println("SOFT START: driving off the start square");
+}
+
+// True (and sets the motor commands) while the soft start is driving.
+static bool soft_start_drive(const TofReading r[TOF_TOTAL_COUNT], const Pose &pose,
+                             int &left_pct, int &right_pct) {
+  if (!soft_start_running) return false;
+  int avoid_left, avoid_right;
+  const bool blocked = tof_nav_update(r, avoid_left, avoid_right) == TOF_NAV_AVOID;
+  if (blocked || millis() - round_start_ms >= SOFT_START_MS) {
+    soft_start_running = false;
+    Serial.println(blocked ? "SOFT START: ended early - obstacle ahead" : "SOFT START: done");
+    return false;
+  }
+  // Positive error = need to turn left (CCW): speed up the right track.
+  const float error = remainderf(radians(ROBOT_START_HEADING_DEG) - pose.theta, 2.0f * PI);
+  const int turn = constrain((int)(SOFT_START_TURN_KP * error),
+                             -SOFT_START_MAX_TURN_PCT, SOFT_START_MAX_TURN_PCT);
+  left_pct = SOFT_START_PCT - turn;
+  right_pct = SOFT_START_PCT + turn;
+  return true;
 }
 
 // A TEL line and a TOF line every loop, whatever path the loop takes. Map cells (Q,)
@@ -205,7 +242,7 @@ static inline void cpu_restart() {
 
 // Bench test ('W'): spin on the spot at the minimum motor power, each way, and
 // report the turn rate - sizes the scan speed against the mapping turn-rate gate.
-static const int      SPIN_TEST_PCT        = 60;    // = MIN_EFFECTIVE_PCT in motors.cpp
+static const int      SPIN_TEST_PCT        = 65;    // = MIN_EFFECTIVE_PCT in motors.cpp
 static const uint32_t SPIN_TEST_SPINUP_MS  = 500;   // ignored while the motors spin up
 static const uint32_t SPIN_TEST_MEASURE_MS = 3000;
 static const uint32_t SPIN_TEST_SAMPLE_MS  = 50;
@@ -452,6 +489,8 @@ static void start_round(const char *source) {
   for (auto &reading : ranges) tof_reading_clear(reading);
   round_start_ms = millis();
   round_phase = ROUND_RUNNING;
+  home_square_begin_round();  // flow ignored until the black line
+  soft_start_begin();
   Serial.print("=== ROUND START ("); Serial.print(source);
   Serial.print(") === x="); Serial.print(ROBOT_START_X_M, 2);
   Serial.print(" y="); Serial.print(ROBOT_START_Y_M, 2);
@@ -549,6 +588,7 @@ void loop() {
   map_decay();
   time_stage(LS_DECAY, timing_mark);
   Pose pose = pose_update();
+  if (home_square_update(pose)) pose = pose_current();  // black-line position fix
   last_pose = pose;
   exploration_mark_footprint(pose);  // ground under the robot has been searched
   time_stage(LS_POSE, timing_mark);
@@ -627,6 +667,8 @@ void loop() {
     // Navigation stays paused throughout feeding, pickup, and arm movement.
     left_pct = right_pct = 0;
     stop_motors();
+  } else if (pose_heading_valid() && soft_start_drive(ranges, pose, left_pct, right_pct)) {
+    set_motors(left_pct, right_pct);
   } else if (pose_heading_valid()) {
     state_machine_update(pose, ranges, weight_seen_this_frame, left_pct, right_pct);
     set_motors(left_pct, right_pct);

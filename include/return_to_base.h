@@ -31,6 +31,19 @@ void return_home_search();
 // returns HOME_COLOR_NOT_FOUND so the caller can decide what to do.
 HomeStatus return_home_update(const Pose &pose, int &left_pct, int &right_pct);
 
+// --- Home square ---
+// The flow sensor reads phantom motion on the coloured home square, so while the
+// robot is on it the flow is ignored, and its position is re-fixed from the black
+// boundary line (a known distance from the corner walls) when it drives off.
+
+// Round start: the robot is on the square, so start blind.
+void home_square_begin_round();
+
+// Call every loop with the latest pose. Blinds the flow on the home colour near
+// home; on reaching the black line, fixes the coordinate across the line being
+// crossed and un-blinds. Returns true if it changed the pose (re-read it).
+bool home_square_update(const Pose &pose);
+
 // Detect what base (if any) the robot is above - placeholder
 void detect_base();
 

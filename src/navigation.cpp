@@ -10,7 +10,7 @@ static const int MAX_TURN_PCT = 60;
 static const float TURN_KP = 90.0f;
 static const float FORWARD_CUTOFF_RAD = radians(60.0f);
 static const float SLOWDOWN_RADIUS_M = 0.60f;
-static const int MIN_APPROACH_PCT = 60;
+static const int MIN_APPROACH_PCT = 65;
 
 static float wrap_angle(float angle_rad) {
     while (angle_rad > PI) angle_rad -= 2.0f * PI;

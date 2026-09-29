@@ -12,7 +12,7 @@ void motors_init() {
 }
 
 static int apply_min_power(int speed_pct) {
-  const int MIN_EFFECTIVE_PCT = 60;   // TODO: confirm exact value on the real drivetrain
+  const int MIN_EFFECTIVE_PCT = 65;   // 60 stalled slightly in testing - TODO: confirm on the real drivetrain
   if (speed_pct == 0) return 0;       // 0 still means "stop", not "min power"
   if (speed_pct > 0 && speed_pct < MIN_EFFECTIVE_PCT)  return MIN_EFFECTIVE_PCT;
   if (speed_pct < 0 && speed_pct > -MIN_EFFECTIVE_PCT) return -MIN_EFFECTIVE_PCT;
@@ -31,7 +31,20 @@ static int speed_to_us(int speed_pct) {
   return MOTOR_US_STOP + (speed_pct * (MOTOR_US_MAX - MOTOR_US_STOP) / 100);
 }
 
+static bool stopped = true;
+static uint32_t stopped_since_ms = 0;
+
+uint32_t motors_stopped_ms() {
+  if (!stopped) return 0;
+  const uint32_t ms = millis() - stopped_since_ms;
+  return ms > 0 ? ms : 1;
+}
+
 void set_motors(int left_speed, int right_speed) {
+  const bool now_stopped = left_speed == 0 && right_speed == 0;
+  if (now_stopped && !stopped) stopped_since_ms = millis();
+  stopped = now_stopped;
+
   int left_us = speed_to_us(left_speed);
   int right_us = speed_to_us(right_speed);
 

@@ -1,5 +1,7 @@
 #include "pose.h"
 #include <Wire.h>
+#include <SPI.h>
+#include "motors.h"
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <Bitcraze_PMW3901.h>
@@ -13,7 +15,13 @@
 // with a known-distance push test once this is set.
 // Raised 24 mm from 80 mm to ~104 mm (estimate - measure lens to floor to confirm).
 float MOUNTING_HEIGHT = 0.104F;
-float FLOW_METERS_PER_COUNT = MOUNTING_HEIGHT * 0.0021f;   // ~0.218 mm/count at 104 mm
+// Calibrated with F tests (original lighting, 70% power):
+//  1. At 0.0002184 (height estimate): 500 -> 585 mm, 415 -> ~500 mm -> 0.000250.
+//  2. At 0.000250: 500 -> 530 mm taped (coast estimated) -> 0.000256.
+//  3. At 0.000256: 460 mm taped vs 514 mm pose displacement -> 0.000229 (used).
+// Run 3 disagrees with 1-2 by ~10% although tracking was clean (SQUAL 97-112),
+// so confirm with a few more F runs. new = this * actual_mm / final_displacement_mm.
+float FLOW_METERS_PER_COUNT = 0.000229f;   // 0.229 mm/count
 
 // Map the sensor's raw dx/dy onto the robot body frame (x = forward, y = left).
 // Push the robot forward, then to the left, and watch raw_dx / raw_dy in the
@@ -22,6 +30,13 @@ float FLOW_METERS_PER_COUNT = MOUNTING_HEIGHT * 0.0021f;   // ~0.218 mm/count at
 static const bool  FLOW_SWAP_XY   = true;  // true if the sensor's dy is the forward axis
 static const float FLOW_SIGN_FWD  = -1.0f;   // flip to -1 if forward push gives negative x
 static const float FLOW_SIGN_LEFT = -1.0f;   // flip to -1 if left push gives negative y
+
+// The sensor is mounted slightly rotated: driving dead straight (checked against a
+// tape line) it reported ~4.4 deg of sideways movement to the left (F tests:
+// 4.19/4.56/4.55 deg). Positive = reports drift LEFT when driving straight.
+// Tune so an F test gives left_mm ~ 0 on a run that is physically straight.
+// TEMPORARILY 0 for the original-lighting baseline test. Measured value: 4.43f.
+static const float FLOW_MOUNT_ANGLE_DEG = 0.0f;
 
 // Flow sensor position relative to the robot's centre of rotation, in metres
 // (forward, left). Leave at 0 if it sits over the centre. If it doesn't,
@@ -38,6 +53,9 @@ static const uint8_t IMU_ADDRESS = 0x28;
 static const uint32_t HEADING_TIMEOUT_MS = 200;
 static Adafruit_BNO055 bno = Adafruit_BNO055(55, IMU_ADDRESS, &Wire1);
 static Bitcraze_PMW3901 *flow_sensor = nullptr;
+#if ENABLE_BENCH_TESTS
+static uint8_t flow_cs_pin = 0;  // for the tracking-quality register reads
+#endif
 
 static Pose current_pose;
 static float theta_offset = 0.0f; // counter-clockwise IMU heading at pose_reset(), subtracted out
@@ -56,6 +74,12 @@ static bool discard_stationary_flow = false;
 static uint32_t last_heading_sample_ms = 0;
 static float pending_flow_fwd_m = 0.0f;
 static float pending_flow_left_m = 0.0f;
+
+// Flow still counts for this long after the motors are commanded to 0 (roll-on).
+static const uint32_t STOPPED_GRACE_MS = 400;
+static bool stationary_filter = true;
+static bool flow_blind = false;
+static float blind_skipped_x = 0.0f, blind_skipped_y = 0.0f;  // world frame, m
 
 // getEvent() does not propagate I2C failures in the installed library.
 // Read the little-endian heading directly, using the same degree scale.
@@ -113,6 +137,9 @@ void pose_init(uint8_t flow_chip_select) {
     Serial.println("BNO055 initialised");
   }
 
+#if ENABLE_BENCH_TESTS
+  flow_cs_pin = flow_chip_select;
+#endif
   flow_sensor = new Bitcraze_PMW3901(flow_chip_select);
   if (!flow_sensor->begin()) {
     Serial.println("ERROR: PMW3901 not detected - check wiring/CS pin");
@@ -194,6 +221,8 @@ void pose_reset() {
   have_heading_sample_time = false;
   last_euler_read_ok = false;
   pending_flow_fwd_m = pending_flow_left_m = 0.0f;
+  flow_blind = false;
+  blind_skipped_x = blind_skipped_y = 0.0f;
 
   if (imu_ready) {
     last_euler_read_ok = read_heading(last_heading_deg_raw);
@@ -231,6 +260,24 @@ void pose_nudge_position(float dx_m, float dy_m) {
   }
 }
 
+void pose_set_stationary_filter(bool enabled) {
+  stationary_filter = enabled;
+}
+
+void pose_set_flow_blind(bool blind, bool apply_skipped) {
+  if (blind == flow_blind) return;
+  if (blind) {
+    blind_skipped_x = blind_skipped_y = 0.0f;
+  } else if (apply_skipped) {
+    pose_nudge_position(blind_skipped_x, blind_skipped_y);
+  }
+  flow_blind = blind;
+}
+
+bool pose_flow_blind() {
+  return flow_blind;
+}
+
 void pose_set_heading(float theta_rad) {
   clear_pose_history();  // earlier samples are in the old frame
   // theta = heading_ccw - theta_offset, so shift the offset by the change.
@@ -253,6 +300,20 @@ void pose_resume_after_collection() {
 // One integration step; pose_update() wraps it to record the result.
 #if ENABLE_BENCH_TESTS
 static FlowDiagnostic flow_diagnostic;
+
+// Same SPI transaction as the Bitcraze library's (private) registerRead().
+static uint8_t flow_register_read(uint8_t reg) {
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE3));
+  digitalWrite(flow_cs_pin, LOW);
+  delayMicroseconds(50);
+  SPI.transfer(reg & 0x7F);
+  delayMicroseconds(50);
+  const uint8_t value = SPI.transfer(0);
+  delayMicroseconds(100);
+  digitalWrite(flow_cs_pin, HIGH);
+  SPI.endTransaction();
+  return value;
+}
 
 FlowDiagnostic pose_flow_diagnostic() { return flow_diagnostic; }
 #endif
@@ -302,6 +363,10 @@ static Pose integrate_step() {
     flow_diagnostic.read = true;  // transaction attempted, not a tracking-quality flag
     flow_diagnostic.raw_x = last_dx_counts;
     flow_diagnostic.raw_y = last_dy_counts;
+    // PMW3901 registers: 0x07 SQUAL, 0x0B Shutter_Lower, 0x0C Shutter_Upper.
+    flow_diagnostic.squal = flow_register_read(0x07);
+    flow_diagnostic.shutter = ((uint16_t)flow_register_read(0x0C) << 8) | flow_register_read(0x0B);
+    flow_diagnostic.quality_read = true;
 #endif
     if (discard_stationary_flow) {
       pending_flow_fwd_m = pending_flow_left_m = 0.0f;
@@ -315,6 +380,12 @@ static Pose integrate_step() {
     float left_counts = FLOW_SWAP_XY ? last_dx_counts : last_dy_counts;
     float sx = fwd_counts  * FLOW_SIGN_FWD  * FLOW_METERS_PER_COUNT;
     float sy = left_counts * FLOW_SIGN_LEFT * FLOW_METERS_PER_COUNT;
+    // Undo the sensor's mounting rotation (rotate clockwise by the mount angle).
+    static const float mount_c = cosf(radians(FLOW_MOUNT_ANGLE_DEG));
+    static const float mount_s = sinf(radians(FLOW_MOUNT_ANGLE_DEG));
+    const float sx_raw = sx;
+    sx = sx_raw * mount_c + sy * mount_s;
+    sy = -sx_raw * mount_s + sy * mount_c;
 #if ENABLE_BENCH_TESTS
     flow_diagnostic.sensor_forward_m = sx;
     flow_diagnostic.sensor_left_m = sy;
@@ -350,9 +421,19 @@ static Pose integrate_step() {
     // Rotate into the world frame using the mid-step heading, then accumulate.
     float ct = cosf(theta_mid);
     float st = sinf(theta_mid);
+    const float wx = dx_body * ct - dy_body * st;
+    const float wy = dx_body * st + dy_body * ct;
 
-    current_pose.x += dx_body * ct - dy_body * st;
-    current_pose.y += dx_body * st + dy_body * ct;
+    if (flow_blind) {
+      blind_skipped_x += wx;  // kept in case the blind ends without a position fix
+      blind_skipped_y += wy;
+    } else if (stationary_filter && motors_stopped_ms() > STOPPED_GRACE_MS) {
+      // Motors off and the roll-on is over: the robot can't be moving, so any
+      // flow is noise or phantom motion. Ignore it.
+    } else {
+      current_pose.x += wx;
+      current_pose.y += wy;
+    }
   }
 
   return current_pose;
