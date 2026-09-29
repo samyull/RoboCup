@@ -8,7 +8,7 @@
 // robot to every reachable cell (8-connected, straight step 10, diagonal 14,
 // i.e. 10 per 5 cm), so path lengths to every weight and frontier come from a
 // single search. The arena border plus a robot half-width is impassable;
-// confirmed walls are impassable and the half-width around them is costly.
+// confirmed walls and the robot footprint margin around them are impassable.
 
 #define PLAN_UNREACHABLE 0xFFFF
 
@@ -21,6 +21,8 @@ void planner_plan(const Pose &pose, PlanMode mode);
 
 uint16_t planner_cost(int gx, int gy);    // PLAN_UNREACHABLE if not reachable
 float planner_distance_m(int gx, int gy); // path length in metres (large if unreachable)
+// Reachable viewpoint with an extra cell of clearance beyond the drive footprint.
+bool planner_goal_clear(int gx, int gy);
 
 // Extract and smooth the path to (gx, gy) from the last plan. False if unreachable.
 // Also prints the path ("PATH,x,y,...") and goal ("T,x,y") for the visualiser.

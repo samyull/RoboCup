@@ -15,13 +15,21 @@
 #include "wall_anchor.h"
 #include "ultrasound.h"
 #include "color_sensor.h"
+#include "bench_config.h"
+#if ENABLE_BENCH_TESTS
+#include "flow_test.h"
+#endif
 
 static const uint8_t FLOW_CHIP_SELECT = 10;
 static TofReading ranges[TOF_TOTAL_COUNT];
 // Matches the current minimum effective motor power; tune on the robot.
 static const int FUNNEL_FEED_SPEED_PCT = 60;
 
+#if ENABLE_BENCH_TESTS
 static bool testing = true;
+// Hold the pre-round loop after a bench test so its summary stays visible.
+static bool bench_output_paused = false;
+#endif
 
 // Correct x/y against the four outer arena walls (see wall_anchor.h).
 static const bool USE_WALL_ANCHOR = true;
@@ -39,7 +47,9 @@ static const uint32_t ROUND_LENGTH_MS    = 120000;
 enum RoundPhase { ROUND_WAITING, ROUND_RUNNING, ROUND_OVER };
 static RoundPhase round_phase = ROUND_WAITING;
 static uint32_t round_start_ms = 0;
+#if ENABLE_BENCH_TESTS
 static bool start_requested = false;  // set by the 'G' serial command (testing only)
+#endif
 
 static const char *round_phase_name() {
   switch (round_phase) {
@@ -129,9 +139,10 @@ static void print_telemetry(int left_pct, int right_pct) {
 }
 
 // Set true to print normal-loop averages/maxima once a second.
-static const bool PRINT_LOOP_TIMING = false;
 enum LoopStage { LS_COLLECTION, LS_DECAY, LS_POSE, LS_DEBUG, LS_TOF, LS_MAP,
                  LS_DRIVE, LS_SERIAL, LS_DELAY, LS_COUNT };
+#if ENABLE_BENCH_TESTS
+static const bool PRINT_LOOP_TIMING = false;
 static const char *stage_names[LS_COUNT] = {
   "collection", "decay", "pose", "debug", "tof", "map", "drive", "serial", "delay"
 };
@@ -168,11 +179,17 @@ static void report_loop_timing(uint32_t loop_start_us) {
   timing_last_report_ms = millis();
   timing_loops = 0; timing_total_us = 0; timing_max_us = 0;
 }
+#else
+static void time_stage(LoopStage, uint32_t &) {}
+static void report_loop_timing(uint32_t) {}
+#endif
+
 static bool collection_motion_active() {
   const WeightState state = weight_collection_state();
   return state == WC_PICKUP || state == WC_CLEARING || state == WC_RELEASING;
 }
 
+#if ENABLE_BENCH_TESTS
 // Standard ARM Cortex-M system reset, via the Application Interrupt and
 // Reset Control Register. Architectural, not Teensy-specific - resets the
 // chip and re-runs setup()/loop() from scratch. Does NOT reflash anything;
@@ -275,17 +292,39 @@ static void run_spin_test() {
   Serial.println("SPIN test done");
 }
 
+#endif // ENABLE_BENCH_TESTS
+
 // 'M': resend the whole map (the visualiser asks on connect; cells are otherwise
 //      only sent when they change, so anything sent earlier would be missed).
 // 'R': restart, bench testing only.
 // 'W': spin-rate test (see run_spin_test), bench testing only.
 // 'G': start the round as if the button were pressed, bench testing only.
+// 'F': 500 mm optical-flow drive test; 'O': full-turn compensation tests.
+// 'P': motors-off raw-flow manual push test. F/O/P require ROUND_WAITING.
+// Send X to stop an active flow test.
+// After a flow test, output stays paused. C resumes pre-round monitoring.
 static void check_serial_commands() {
   while (Serial.available() > 0) {
     const char c = Serial.read();
     if (c == 'M') {
       map_publish_all();
       exploration_publish_all();
+    }
+#if ENABLE_BENCH_TESTS
+    else if ((c == 'F' || c == 'O' || c == 'P') && testing) {
+      if (round_phase == ROUND_WAITING) {
+        bench_output_paused = false;
+        flow_test_run(c);
+        bench_output_paused = true;
+        Serial.println("SERIAL PAUSED - copy the summary above. C resumes; P/F/O runs another test.");
+      }
+      else Serial.println("FLOW_TEST,refused=reset and test before starting the round");
+    } else if ((c == 'X' || c == 'x') && testing && round_phase == ROUND_WAITING) {
+      bench_output_paused = true;
+      Serial.println("SERIAL PAUSED - C resumes; P/F/O runs another test.");
+    } else if (c == 'C' && testing && round_phase == ROUND_WAITING) {
+      bench_output_paused = false;
+      Serial.println("Pre-round monitoring resumed");
     } else if (c == 'G' && testing) {
       start_requested = true;
     } else if (c == 'W' && testing) {
@@ -295,6 +334,7 @@ static void check_serial_commands() {
       delay(50);   // let the message actually get out before resetting
       cpu_restart();
     }
+#endif
   }
 }
 
@@ -343,7 +383,20 @@ static const char *wait_for_start() {
 
   while (true) {
     check_serial_commands();
+#if ENABLE_BENCH_TESTS
     if (start_requested) return "serial G";
+    if (bench_output_paused) {
+      // Keep odometry current without ToF retries, colour events or button
+      // diagnostics scrolling the result away. C re-arms the start button.
+      stop_motors();
+      last_pose = pose_update();
+      stage = START_ARMING;
+      stage_since_ms = millis();
+      samples = pressed_samples = 0;
+      delay(20);
+      continue;
+    }
+#endif
     ultrasound_update();
     color_sensor_update();
 

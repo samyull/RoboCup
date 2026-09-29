@@ -7,7 +7,6 @@
 static const float    ROBOT_HALF_WIDTH_M  = 0.155f;
 static const uint16_t STEP_COST           = 10;   // per 5 cm straight
 static const uint16_t DIAG_COST           = 14;
-static const uint16_t NEAR_WALL_PENALTY   = 60;   // per cell entered within a half-width of a wall
 static const uint16_t BAND_ESCAPE_PENALTY = 200;  // leaving the border band after drifting into it
 static const float    WAYPOINT_REACHED_M  = 0.12f;
 static const int      MAX_PATH_CELLS      = 600;
@@ -15,7 +14,6 @@ static const int      MAX_WAYPOINTS       = 48;
 
 enum CellClass : uint8_t {
   CELL_OPEN,       // free to drive
-  CELL_NEAR_WALL,  // within a half-width of a confirmed wall: allowed, but costly
   CELL_BAND,       // within a half-width of the arena border: never entered, except to escape it
   CELL_BLOCKED,    // wall, border, or (going home) unseen
 };
@@ -93,16 +91,18 @@ static void classify_cells(PlanMode mode) {
       else if (mode == PLAN_SEEN_ONLY && !exploration_fine_seen(gx, gy)) c = CELL_BLOCKED;
       cell_class[gy][gx] = c;
     }
-  // Robot-half-width margin around confirmed walls (not the border - that is the band).
-  const int r = (int)(ROBOT_HALF_WIDTH_M / MAP_CELL_SIZE_M + 0.5f);
+  // Inflate occupied cell areas, not just their centres. A circumscribed
+  // half-cell diagonal conservatively covers the entire occupied square.
+  const float clearance = ROBOT_HALF_WIDTH_M + MAP_CELL_SIZE_M * 0.707107f;
+  const int r = (int)ceilf(clearance / MAP_CELL_SIZE_M);
   for (int gy = 0; gy < MAP_GRID_H; ++gy)
     for (int gx = 0; gx < MAP_GRID_W; ++gx) {
       if (map_get_cell(gx, gy) != MAP_CELL_OBSTACLE) continue;
       for (int dy = -r; dy <= r; ++dy)
         for (int dx = -r; dx <= r; ++dx) {
-          if (dx * dx + dy * dy > r * r) continue;
+          if ((dx * dx + dy * dy) * MAP_CELL_SIZE_M * MAP_CELL_SIZE_M > clearance * clearance) continue;
           const int nx = gx + dx, ny = gy + dy;
-          if (in_grid(nx, ny) && cell_class[ny][nx] == CELL_OPEN) cell_class[ny][nx] = CELL_NEAR_WALL;
+          if (in_grid(nx, ny)) cell_class[ny][nx] = CELL_BLOCKED;
         }
     }
 }
@@ -124,6 +124,10 @@ void planner_plan(const Pose &pose, PlanMode mode) {
   for (int i = 0; i < N_CELLS; ++i) heap_pos[i] = -1;
   heap_size = 0;
 
+  have_plan = true;
+  // Never seed a route inside a mapped obstacle or its footprint margin.
+  if (cell_class[sgy][sgx] == CELL_BLOCKED) return;
+
   dist[sgy][sgx] = 0;
   heap_push_or_decrease(sgy * MAP_GRID_W + sgx);
   while (heap_size > 0) {
@@ -137,9 +141,9 @@ void planner_plan(const Pose &pose, PlanMode mode) {
         const uint8_t c = cell_class[vy][vx];
         if (c == CELL_BLOCKED || (c == CELL_BAND && !escape)) continue;
         // No cutting diagonally past a blocked corner.
-        if (dx && dy && (cell_class[uy][vx] == CELL_BLOCKED || cell_class[vy][ux] == CELL_BLOCKED)) continue;
+        if (dx && dy && (cell_class[uy][vx] == CELL_BLOCKED || cell_class[vy][ux] == CELL_BLOCKED ||
+            (!escape && (cell_class[uy][vx] == CELL_BAND || cell_class[vy][ux] == CELL_BAND)))) continue;
         uint32_t step = (dx && dy) ? DIAG_COST : STEP_COST;
-        if (c == CELL_NEAR_WALL) step += NEAR_WALL_PENALTY;
         if (c == CELL_BAND) step += BAND_ESCAPE_PENALTY;
         const uint32_t nd = (uint32_t)dist[uy][ux] + step;
         if (nd >= PLAN_UNREACHABLE || nd >= dist[vy][vx]) continue;
@@ -168,18 +172,26 @@ static int waypoint_count = 0;
 static int waypoint_index = 0;
 static float path_start_x = 0.0f, path_start_y = 0.0f;
 
-// Every cell on the segment is plain open ground (endpoints only need to be passable).
+// Check endpoints and both side cells on a diagonal step. Border-band routes
+// may leave the band, but shortcuts may not enter it from open ground.
 static bool cells_clear(int x0, int y0, int x1, int y1) {
+  if (!in_grid(x0, y0) || !in_grid(x1, y1)) return false;
+  const bool escape = cell_class[y0][x0] == CELL_BAND;
+  auto passable = [escape](int x, int y) {
+    return cell_class[y][x] == CELL_OPEN || (escape && cell_class[y][x] == CELL_BAND);
+  };
+  if (!passable(x0, y0) || !passable(x1, y1)) return false;
   int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
   int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
   int err = dx + dy;
   int x = x0, y = y0;
   while (x != x1 || y != y1) {
+    const int old_x = x, old_y = y;
     const int e2 = 2 * err;
     if (e2 >= dy) { err += dy; x += sx; }
     if (e2 <= dx) { err += dx; y += sy; }
-    if (x == x1 && y == y1) break;
-    if (cell_class[y][x] != CELL_OPEN) return false;
+    if (!passable(x, y)) return false;
+    if (x != old_x && y != old_y && (!passable(x, old_y) || !passable(old_x, y))) return false;
   }
   return true;
 }
@@ -217,7 +229,10 @@ bool planner_set_goal(int gx, int gy) {
     int j = anchor + 1;
     while (j + 1 < n && cells_clear(cells[anchor] % MAP_GRID_W, cells[anchor] / MAP_GRID_W,
                                     cells[j + 1] % MAP_GRID_W, cells[j + 1] / MAP_GRID_W)) ++j;
-    if (waypoint_count == MAX_WAYPOINTS - 1) j = n - 1;  // out of room: go straight for the goal
+    if (waypoint_count == MAX_WAYPOINTS - 1 && j != n - 1) {
+      waypoint_count = 0;  // Never replace a long safe route with an unchecked shortcut.
+      return false;
+    }
     grid_to_world(cells[j] % MAP_GRID_W, cells[j] / MAP_GRID_W, waypoints[waypoint_count].x,
                   waypoints[waypoint_count].y);
     ++waypoint_count;
@@ -240,11 +255,14 @@ bool planner_follow(const Pose &pose, float arrive_m, int &left_pct, int &right_
   left_pct = right_pct = 0;
   if (waypoint_count == 0) return false;
   while (waypoint_index < waypoint_count - 1 &&
-         distance_to(pose, waypoints[waypoint_index]) < WAYPOINT_REACHED_M) ++waypoint_index;
+         distance_to(pose, waypoints[waypoint_index]) < WAYPOINT_REACHED_M &&
+         planner_straight_clear(pose.x, pose.y, waypoints[waypoint_index + 1].x,
+                                waypoints[waypoint_index + 1].y)) ++waypoint_index;
   if (waypoint_index == waypoint_count - 1 && distance_to(pose, waypoints[waypoint_index]) <= arrive_m) {
     return true;
   }
-  navigate_to_target(pose, waypoints[waypoint_index], left_pct, right_pct);
+  if (planner_straight_clear(pose.x, pose.y, waypoints[waypoint_index].x, waypoints[waypoint_index].y))
+    navigate_to_target(pose, waypoints[waypoint_index], left_pct, right_pct);
   return false;
 }
 
@@ -253,17 +271,13 @@ bool planner_straight_clear(float x0, float y0, float x1, float y1) {
   int ax, ay, bx, by;
   world_to_grid(x0, y0, ax, ay);
   world_to_grid(x1, y1, bx, by);
-  if (!in_grid(ax, ay) || !in_grid(bx, by)) return false;
-  int dx = abs(bx - ax), sx = ax < bx ? 1 : -1;
-  int dy = -abs(by - ay), sy = ay < by ? 1 : -1;
-  int err = dx + dy;
-  int x = ax, y = ay;
-  while (x != bx || y != by) {
-    const int e2 = 2 * err;
-    if (e2 >= dy) { err += dy; x += sx; }
-    if (e2 <= dx) { err += dx; y += sy; }
-    if (x == bx && y == by) break;
-    if (cell_class[y][x] == CELL_BLOCKED) return false;
-  }
-  return true;
+  return cells_clear(ax, ay, bx, by);
+}
+
+bool planner_goal_clear(int gx, int gy) {
+  // Viewpoints need an extra cell of breathing room beyond the drive footprint.
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+      if (!in_grid(gx + dx, gy + dy) || cell_class[gy + dy][gx + dx] != CELL_OPEN) return false;
+  return planner_cost(gx, gy) != PLAN_UNREACHABLE;
 }

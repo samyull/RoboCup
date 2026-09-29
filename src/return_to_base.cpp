@@ -11,7 +11,7 @@
 #include "arena_config.h"
 #include "Arduino.h"
 
-static const float    HOME_ARRIVE_M   = 0.15f;
+static const float    HOME_ARRIVE_M   = 0.05f;
 static const uint32_t REPLAN_MS       = 500;
 static const uint32_t BLOCKED_WAIT_MS = 3000;  // give a blocking robot time to move
 
@@ -40,7 +40,11 @@ void return_home_begin() {
 bool return_home_update(const Pose &pose, int &left_pct, int &right_pct) {
   left_pct = right_pct = 0;
   const Target home = return_home_target();
-  if (distance_to(pose, home) <= HOME_ARRIVE_M) return true;
+  // Both position and base colour must agree before unloading. Hold still
+  // inside the home radius while waiting for the colour sensor to confirm.
+  if (distance_to(pose, home) <= HOME_ARRIVE_M) {
+    return color_sensor_color() == ROBOT_HOME_COLOR;
+  }
 
   const uint32_t now = millis();
   if (now - last_plan_ms >= REPLAN_MS) {
@@ -65,7 +69,12 @@ bool return_home_update(const Pose &pose, int &left_pct, int &right_pct) {
     }
   }
   if (!have_path) return false;  // hold still while waiting
-  return planner_follow(pose, HOME_ARRIVE_M, left_pct, right_pct);
+  if (planner_follow(pose, HOME_ARRIVE_M, left_pct, right_pct)) {
+    // The planner targets a rounded grid cell. Finish at the exact configured
+    // home position; reaching the path endpoint alone cannot confirm arrival.
+    navigate_to_target(pose, home, left_pct, right_pct);
+  }
+  return false;
 }
 
 // Detect what base (if any) the robot is above

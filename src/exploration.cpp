@@ -21,6 +21,8 @@ static const float    CORNER_MARGIN_M        = 0.4f;
 static const float    GOAL_HYSTERESIS        = 0.3f;    // switch goal only if this much better
 static const uint32_t SKIP_GOAL_MS           = 10000;   // unreachable/stuck goal cooldown
 static const int      PUBLISH_MAX_PER_CALL   = 40;
+static const float    VIEW_GAIN_PER_CELL     = 0.02f;
+static const float    MIN_GOAL_DISTANCE_M    = 0.20f; // beyond the 15 cm arrival radius
 
 static bool     fine_seen[MAP_GRID_H][MAP_GRID_W];
 static uint8_t  seen_count[EXPLORE_H][EXPLORE_W];
@@ -170,6 +172,29 @@ static bool is_frontier(int cx, int cy, int robot_cx, int robot_cy, uint32_t now
   return false;
 }
 
+// Potential visibility after turning at a viewpoint: eight rays, at most
+// 60 cm, stopping at mapped walls. Count unseen cells in this frontier cluster,
+// beyond the robot footprint. This is a goal score, not a new seen observation.
+static int visible_unseen(int gx, int gy, int cluster,
+                          const int16_t clusters[EXPLORE_H][EXPLORE_W]) {
+  int gain = 0;
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      if (!dx && !dy) continue;
+      for (int step = 1; step <= 12; ++step) {
+        if (step * MAP_CELL_SIZE_M * (dx && dy ? 1.414214f : 1.0f) > 0.60f) break;
+        const int x = gx + step * dx, y = gy + step * dy;
+        if (!interior(x, y) || map_get_cell(x, y) == MAP_CELL_OBSTACLE) break;
+        if (dx && dy && (map_get_cell(x - dx, y) == MAP_CELL_OBSTACLE ||
+                         map_get_cell(x, y - dy) == MAP_CELL_OBSTACLE)) break;
+        int cx, cy;
+        fine_to_coarse(x, y, cx, cy);
+        if (step >= 4 && !fine_seen[y][x] && clusters[cy][cx] == cluster) ++gain;
+      }
+    }
+  return gain;
+}
+
 bool exploration_choose_frontier(const Pose &pose, FrontierGoal &goal) {
   const uint32_t now = millis();
   int rgx, rgy, robot_cx, robot_cy;
@@ -177,7 +202,7 @@ bool exploration_choose_frontier(const Pose &pose, FrontierGoal &goal) {
   fine_to_coarse(constrain(rgx, 1, MAP_GRID_W - 2), constrain(rgy, 1, MAP_GRID_H - 2), robot_cx, robot_cy);
 
   static bool frontier[EXPLORE_H][EXPLORE_W];
-  static int8_t cluster_of[EXPLORE_H][EXPLORE_W];
+  static int16_t cluster_of[EXPLORE_H][EXPLORE_W];
   for (int cy = 0; cy < EXPLORE_H; ++cy)
     for (int cx = 0; cx < EXPLORE_W; ++cx) {
       frontier[cy][cx] = is_frontier(cx, cy, robot_cx, robot_cy, now);
@@ -186,6 +211,7 @@ bool exploration_choose_frontier(const Pose &pose, FrontierGoal &goal) {
 
   bool found_best = false, found_current = false;
   FrontierGoal best = {}, current = {};
+  int best_source = 0, current_source = 0;
   static int16_t queue[EXPLORE_W * EXPLORE_H];
   int cluster_id = 0;
 
@@ -197,7 +223,7 @@ bool exploration_choose_frontier(const Pose &pose, FrontierGoal &goal) {
       float sum_x = 0.0f, sum_y = 0.0f;
       bool holds_current_goal = false;
       queue[tail++] = sy * EXPLORE_W + sx;
-      cluster_of[sy][sx] = (int8_t)cluster_id;
+      cluster_of[sy][sx] = cluster_id;
       while (head < tail) {
         const int cx = queue[head] % EXPLORE_W, cy = queue[head] / EXPLORE_W;
         ++head;
@@ -210,25 +236,37 @@ bool exploration_choose_frontier(const Pose &pose, FrontierGoal &goal) {
             const int nx = cx + dx, ny = cy + dy;
             if (nx < 0 || nx >= EXPLORE_W || ny < 0 || ny >= EXPLORE_H) continue;
             if (!frontier[ny][nx] || cluster_of[ny][nx] >= 0) continue;
-            cluster_of[ny][nx] = (int8_t)cluster_id;
+            cluster_of[ny][nx] = cluster_id;
             queue[tail++] = ny * EXPLORE_W + nx;
           }
       }
       const float centre_x = sum_x / size, centre_y = sum_y / size;
 
-      // Goal: the reachable map cell in the cluster nearest its centre.
+      // Approach from observed ground in or beside the frontier. Require room
+      // to manoeuvre and an unobstructed view of unseen cells in this cluster.
       int goal_gx = -1, goal_gy = -1;
-      float best_d2 = 1e9f;
+      int goal_gain = 0, goal_source = 0;
+      float best_view_score = -1e9f;
       for (int i = 0; i < tail; ++i) {
         int gx0, gy0, gx1, gy1;
         coarse_fine_range(queue[i] % EXPLORE_W, queue[i] / EXPLORE_W, gx0, gy0, gx1, gy1);
-        for (int gy = gy0; gy <= gy1; ++gy)
-          for (int gx = gx0; gx <= gx1; ++gx) {
-            if (planner_cost(gx, gy) == PLAN_UNREACHABLE) continue;
+        for (int gy = max(1, gy0 - 4); gy <= min(MAP_GRID_H - 2, gy1 + 4); ++gy)
+          for (int gx = max(1, gx0 - 4); gx <= min(MAP_GRID_W - 2, gx1 + 4); ++gx) {
+            if (!fine_seen[gy][gx] || !planner_goal_clear(gx, gy)) continue;
             float x, y;
             grid_to_world(gx, gy, x, y);
-            const float d2 = (x - centre_x) * (x - centre_x) + (y - centre_y) * (y - centre_y);
-            if (d2 < best_d2) { best_d2 = d2; goal_gx = gx; goal_gy = gy; }
+            if (hypotf(x - pose.x, y - pose.y) < MIN_GOAL_DISTANCE_M) continue;
+            int cx, cy;
+            fine_to_coarse(gx, gy, cx, cy);
+            if ((int32_t)(skip_until_ms[cy][cx] - now) > 0) continue;
+            const int gain = visible_unseen(gx, gy, cluster_id, cluster_of);
+            if (gain < 3) continue;
+            const float score = VIEW_GAIN_PER_CELL * gain - planner_distance_m(gx, gy) -
+                                0.15f * hypotf(x - centre_x, y - centre_y);
+            if (score > best_view_score) {
+              best_view_score = score; goal_gx = gx; goal_gy = gy;
+              goal_gain = gain; goal_source = queue[i];
+            }
           }
       }
       ++cluster_id;
@@ -244,23 +282,35 @@ bool exploration_choose_frontier(const Pose &pose, FrontierGoal &goal) {
       grid_to_world(goal_gx, goal_gy, candidate.x, candidate.y);
       candidate.score = SCORE_FROM_START_PER_M * from_start + SCORE_PER_CELL * size -
                         SCORE_PATH_PER_M * planner_distance_m(goal_gx, goal_gy) -
-                        (corner ? SCORE_CORNER_PENALTY : 0.0f);
-      if (!found_best || candidate.score > best.score) { best = candidate; found_best = true; }
-      if (holds_current_goal) { current = candidate; found_current = true; }
+                        (corner ? SCORE_CORNER_PENALTY : 0.0f) + VIEW_GAIN_PER_CELL * goal_gain;
+      if (!found_best || candidate.score > best.score) {
+        best = candidate; best_source = goal_source; found_best = true;
+      }
+      if (holds_current_goal) { current = candidate; current_source = goal_source; found_current = true; }
     }
 
   if (!found_best) {
     have_goal = false;
     return false;
   }
-  goal = (found_current && best.score < current.score + GOAL_HYSTERESIS) ? current : best;
+  const bool keep = found_current && best.score < current.score + GOAL_HYSTERESIS;
+  goal = keep ? current : best;
   have_goal = true;
-  fine_to_coarse(goal.gx, goal.gy, goal_cx, goal_cy);
+  const int source = keep ? current_source : best_source;
+  goal_cx = source % EXPLORE_W;
+  goal_cy = source / EXPLORE_W;
   return true;
 }
 
 void exploration_skip_current_goal() {
   if (!have_goal) return;
-  skip_until_ms[goal_cy][goal_cx] = millis() + SKIP_GOAL_MS;
+  // Retire the neighbourhood too: otherwise a goal a few cm away can repeat
+  // the same blocked approach on the very next plan.
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      const int cx = goal_cx + dx, cy = goal_cy + dy;
+      if (cx >= 0 && cx < EXPLORE_W && cy >= 0 && cy < EXPLORE_H)
+        skip_until_ms[cy][cx] = millis() + SKIP_GOAL_MS;
+    }
   have_goal = false;
 }

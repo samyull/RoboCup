@@ -1,6 +1,8 @@
 #ifndef ARENA_CONFIG_H
 #define ARENA_CONFIG_H
 
+#include "color_sensor.h"
+
 // ---------------------------------------------------------------------------
 // STARTING LAYOUT - set before every round.
 // Leave exactly ONE block below uncommented.
@@ -15,23 +17,27 @@
 // ---------------------------------------------------------------------------
 
 // BLUE corner, facing along the long wall
-#define ROBOT_START_X_M         0.3f
-#define ROBOT_START_Y_M         0.3f
-#define ROBOT_START_HEADING_DEG 0.0f
+// #define ROBOT_START_X_M         0.3f
+// #define ROBOT_START_Y_M         0.3f
+// #define ROBOT_START_HEADING_DEG 0.0f
+// #define ROBOT_HOME_COLOR        COLOR_BLUE
 
 // BLUE corner, facing along the short wall (towards green)
 // #define ROBOT_START_X_M         0.3f
 // #define ROBOT_START_Y_M         0.3f
 // #define ROBOT_START_HEADING_DEG 90.0f
+// #define ROBOT_HOME_COLOR        COLOR_BLUE
 
 // GREEN corner, facing along the long wall
-// #define ROBOT_START_X_M         0.3f
-// #define ROBOT_START_Y_M         2.1f
-// #define ROBOT_START_HEADING_DEG 0.0f
+#define ROBOT_START_X_M         0.3f
+#define ROBOT_START_Y_M         2.1f
+#define ROBOT_START_HEADING_DEG 0.0f
+#define ROBOT_HOME_COLOR        COLOR_GREEN
 
 // GREEN corner, facing along the short wall (towards blue)
 // #define ROBOT_START_X_M         0.3f
 // #define ROBOT_START_Y_M         2.1f
 // #define ROBOT_START_HEADING_DEG -90.0f
+// #define ROBOT_HOME_COLOR        COLOR_GREEN
 
 #endif

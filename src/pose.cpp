@@ -251,7 +251,16 @@ void pose_resume_after_collection() {
 }
 
 // One integration step; pose_update() wraps it to record the result.
+#if ENABLE_BENCH_TESTS
+static FlowDiagnostic flow_diagnostic;
+
+FlowDiagnostic pose_flow_diagnostic() { return flow_diagnostic; }
+#endif
+
 static Pose integrate_step() {
+#if ENABLE_BENCH_TESTS
+  flow_diagnostic = FlowDiagnostic{};
+#endif
   float d_theta = 0.0f;                 // heading change this step (rad, CCW+)
   float theta_mid = current_pose.theta; // heading half-way through the step
   last_angular_speed = NAN; // No measurement must not look like zero rotation.
@@ -289,6 +298,11 @@ static Pose integrate_step() {
   // --- Position from PMW3901 optical flow, rotated into the global frame ---
   if (flow_ready) {
     flow_sensor->readMotionCount(&last_dx_counts, &last_dy_counts);
+#if ENABLE_BENCH_TESTS
+    flow_diagnostic.read = true;  // transaction attempted, not a tracking-quality flag
+    flow_diagnostic.raw_x = last_dx_counts;
+    flow_diagnostic.raw_y = last_dy_counts;
+#endif
     if (discard_stationary_flow) {
       pending_flow_fwd_m = pending_flow_left_m = 0.0f;
       discard_stationary_flow = !last_euler_read_ok;
@@ -301,6 +315,10 @@ static Pose integrate_step() {
     float left_counts = FLOW_SWAP_XY ? last_dx_counts : last_dy_counts;
     float sx = fwd_counts  * FLOW_SIGN_FWD  * FLOW_METERS_PER_COUNT;
     float sy = left_counts * FLOW_SIGN_LEFT * FLOW_METERS_PER_COUNT;
+#if ENABLE_BENCH_TESTS
+    flow_diagnostic.sensor_forward_m = sx;
+    flow_diagnostic.sensor_left_m = sy;
+#endif
 
     // Keep flow and heading changes over the same interval across a brief
     // failed read. Do not rotate flow into the map using a stale heading.
@@ -323,6 +341,11 @@ static Pose integrate_step() {
     float corr_y = s * FLOW_OFFSET_FWD_M + (c - 1.0f) * FLOW_OFFSET_LEFT_M;
     float dx_body = sx - corr_x;
     float dy_body = sy - corr_y;
+#if ENABLE_BENCH_TESTS
+    flow_diagnostic.integrated = true;
+    flow_diagnostic.correction_forward_m = corr_x;
+    flow_diagnostic.correction_left_m = corr_y;
+#endif
 
     // Rotate into the world frame using the mid-step heading, then accumulate.
     float ct = cosf(theta_mid);

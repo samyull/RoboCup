@@ -108,4 +108,16 @@ void pose_set_heading(float theta_rad);
 
 float angular_speed_rad_s();
 
+#include "bench_config.h"
+#if ENABLE_BENCH_TESTS
+// Snapshot of the last pose_update(), without another sensor read.
+struct FlowDiagnostic {
+  int16_t raw_x = 0, raw_y = 0;
+  bool read = false, integrated = false;
+  float sensor_forward_m = 0, sensor_left_m = 0;
+  float correction_forward_m = 0, correction_left_m = 0;
+};
+FlowDiagnostic pose_flow_diagnostic();
+#endif
+
 #endif // POSE_H

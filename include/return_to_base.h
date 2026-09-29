@@ -16,7 +16,8 @@ void return_home_begin();
 
 // Plan and drive home over ground already seen. If that route is blocked
 // (most likely another robot), hold and retry for a few seconds, then allow
-// unexplored ground as a last resort. Returns true once home.
+// unexplored ground as a last resort. Returns true only within 5 cm of home
+// with the configured home colour detected. Holds there awaiting colour confirmation.
 bool return_home_update(const Pose &pose, int &left_pct, int &right_pct);
 
 // Detect what base (if any) the robot is above - placeholder

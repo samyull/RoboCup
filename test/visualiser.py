@@ -6,9 +6,8 @@ Run: python visualiser.py            (finds the Teensy's port automatically)
      python visualiser.py COM5 --no-reset
      python visualiser.py COM5 --debug
 
-Sends R once per launch by default (bench testing: resets robot state).
-Reconnects to the same port after USB reset, without sending R again.
-On every other connect it sends M, and the robot resends its whole map.
+Requests the current map with M on connect; does not reset the robot by default.
+Use --reset only with bench firmware to send R once, then reconnect after reset.
 """
 
 import argparse
@@ -57,7 +56,7 @@ def grid_to_world(gx, gy):
 
 
 class Visualiser:
-    def __init__(self, port, reset=True, debug=False):
+    def __init__(self, port, reset=False, debug=False):
         self.port = port
         self.debug = debug
         self.ser = None
@@ -372,12 +371,14 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("port", nargs="?",
                         help="Serial port, e.g. COM5 or /dev/ttyACM0 (default: auto-detect Teensy)")
-    parser.add_argument("--no-reset", action="store_true", help="Connect without sending R")
+    reset_options = parser.add_mutually_exclusive_group()
+    reset_options.add_argument("--reset", action="store_true", help="Request restart (bench firmware only)")
+    reset_options.add_argument("--no-reset", action="store_true", help="Connect without sending R (default)")
     parser.add_argument("--debug", action="store_true", help="Print all received lines")
     args = parser.parse_args()
     port = args.port or find_teensy_port()
     print(f"Using {port}", flush=True)
-    Visualiser(port, reset=not args.no_reset, debug=args.debug).run()
+    Visualiser(port, reset=args.reset, debug=args.debug).run()
 
 
 if __name__ == "__main__":
