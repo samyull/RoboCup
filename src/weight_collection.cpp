@@ -31,11 +31,12 @@ struct CraneStep {
 };
 
 static const CraneStep PICKUP_STEPS[] = {
-  {63,  100, 300, MAG_ON },   // lower slowly onto the weight, magnets on
-  {65,  50,  500, MAG_NONE},  // let the magnets grab
-  {34,  50,  200, MAG_NONE},  // lift
-  {42,  100, 1000, MAG_OFF },  // settle, drop the weight
-  {40,  100, 300, MAG_NONE},
+  {63,  120, 300, MAG_ON },   // lower slowly onto the weight, magnets on
+  {66,  120,  200, MAG_NONE},  // let the magnets grab
+  {36,  50,  500, MAG_NONE},  // lift
+  {38,  100, 200, MAG_OFF },  // settle, drop the weight
+  {50,  30,  300, MAG_NONE},
+  {64,  100, 200, MAG_NONE},
   {CRANE_IDLE_ANGLE, CRANE_IDLE_SPEED, 0, MAG_NONE},  // back to idle
 };
 static const int PICKUP_STEP_COUNT = sizeof(PICKUP_STEPS) / sizeof(PICKUP_STEPS[0]);

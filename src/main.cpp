@@ -13,6 +13,8 @@
 #include "arena_config.h"
 #include "exploration.h"
 #include "wall_anchor.h"
+#include "ultrasound.h"
+#include "color_sensor.h"
 
 static const uint8_t FLOW_CHIP_SELECT = 10;
 static TofReading ranges[TOF_TOTAL_COUNT];
@@ -48,6 +50,37 @@ static const char *round_phase_name() {
   return "?";
 }
 
+// --- Ultrasound escape ---
+// Left ultrasound interrupt -> left track reverses; right -> right track reverses;
+// both at once -> full reverse. Lasts US_ESCAPE_MS from the latest trigger.
+// Overrides navigation, but never weight collection or an IMU timeout stop.
+static const uint32_t US_ESCAPE_MS        = 2000;
+static const int      US_ESCAPE_SPEED_PCT = 60;   // minimum effective motor power
+static uint32_t us_escape_start_ms = 0;
+static bool us_escape_running = false;
+static int us_escape_left_pct = 0, us_escape_right_pct = 0;
+
+// Attached to both ultrasound interrupts in setup(). Re-reads both sides so a
+// second side triggering during an escape upgrades it to a full reverse.
+static void on_ultrasound_interrupt() {
+  if (round_phase != ROUND_RUNNING) return;
+  const bool left = ultrasound_interrupt_left(), right = ultrasound_interrupt_right();
+  us_escape_left_pct  = left  ? -US_ESCAPE_SPEED_PCT : 0;
+  us_escape_right_pct = right ? -US_ESCAPE_SPEED_PCT : 0;
+  us_escape_start_ms = millis();
+  us_escape_running = true;
+  Serial.print("ULTRASOUND ESCAPE: ");
+  Serial.println(left && right ? "full reverse" : left ? "left track reverse" : "right track reverse");
+}
+
+static bool us_escape_active() {
+  if (us_escape_running && millis() - us_escape_start_ms >= US_ESCAPE_MS) {
+    us_escape_running = false;
+    Serial.println("Ultrasound escape finished");
+  }
+  return us_escape_running;
+}
+
 // A TEL line and a TOF line every loop, whatever path the loop takes. Map cells (Q,)
 // and one-off events (state changes, warnings) are still printed as they happen.
 static Pose last_pose;
@@ -77,6 +110,21 @@ static void print_telemetry(int left_pct, int right_pct) {
     if (tof_reading_usable(ranges[i])) Serial.print(ranges[i].range_mm);
     else Serial.print("-");
   }
+  // Ultrasounds on the same line, also in mm.
+  for (uint8_t i = 0; i < US_COUNT; ++i) {
+    uint16_t mm;
+    Serial.print(","); Serial.print(ultrasound_name(i)); Serial.print("=");
+    if (ultrasound_read_mm(i, mm)) Serial.print(mm);
+    else Serial.print("-");
+  }
+  // Surface colour last, with raw counts for calibration.
+  Serial.print(",COL="); Serial.print(color_name(color_sensor_color()));
+  uint16_t r, g, b, c;
+  Serial.print(",RGBC=");
+  if (color_sensor_raw(r, g, b, c)) {
+    Serial.print(r); Serial.print("/"); Serial.print(g); Serial.print("/");
+    Serial.print(b); Serial.print("/"); Serial.print(c);
+  } else Serial.print("-");
   Serial.println();
 }
 
@@ -296,6 +344,8 @@ static const char *wait_for_start() {
   while (true) {
     check_serial_commands();
     if (start_requested) return "serial G";
+    ultrasound_update();
+    color_sensor_update();
 
     const uint32_t now = millis();
     const int level = digitalRead(START_BUTTON_PIN);
@@ -377,6 +427,10 @@ void setup() {
 
   induction_init();
   ir_proximity_init();
+  ultrasound_init();
+  ultrasound_attach_interrupt_left(on_ultrasound_interrupt);
+  ultrasound_attach_interrupt_right(on_ultrasound_interrupt);
+  color_sensor_init();  // after pose_init(): shares Wire1 with the IMU
   arms_init();
   electromagnets_init();
   weight_collection_init();   // parks crane at idle, arms at rest
@@ -390,6 +444,8 @@ void setup() {
 
 void loop() {
   check_serial_commands();
+  ultrasound_update();
+  color_sensor_update();
 
   if (round_phase == ROUND_RUNNING && millis() - round_start_ms >= ROUND_LENGTH_MS) {
     round_phase = ROUND_OVER;
@@ -500,6 +556,10 @@ void loop() {
       last_heading_warn_ms = millis();
       Serial.println("IMU HEADING TIMEOUT - motors held off; retrying");
     }
+  } else if (!weight_collection_busy() && us_escape_active()) {
+    left_pct = us_escape_left_pct;
+    right_pct = us_escape_right_pct;
+    set_motors(left_pct, right_pct);
   } else if (recovery_active || obstacle_data_missing) {
     // Also hold scan/verification turns when the obstacle sensors are unknown.
     left_pct = right_pct = 0;

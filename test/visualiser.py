@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Live robot grid. Install: pip install pyserial matplotlib numpy
 
-Run: python visualiser.py COM5
+Run: python visualiser.py            (finds the Teensy's port automatically)
+     python visualiser.py COM5
      python visualiser.py COM5 --no-reset
      python visualiser.py COM5 --debug
 
@@ -19,6 +20,7 @@ from matplotlib.colors import LinearSegmentedColormap, ListedColormap, Normalize
 from matplotlib.patches import Patch
 import numpy as np
 import serial
+from serial.tools import list_ports
 
 # Must match grid_map.h, including its grid dimensions.
 CELL_SIZE_M = 0.05
@@ -350,14 +352,32 @@ class Visualiser:
             self.close()
 
 
+TEENSY_USB_VID = 0x16C0  # PJRC
+
+
+def find_teensy_port(timeout_s=10.0):
+    """Return the first Teensy serial port, waiting up to timeout_s for it to appear."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        ports = [p.device for p in list_ports.comports() if p.vid == TEENSY_USB_VID]
+        if ports:
+            return ports[0]
+        if time.monotonic() >= deadline:
+            raise SystemExit("No Teensy found - plug it in, or pass the port (e.g. COM5)")
+        time.sleep(0.5)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("port", help="Serial port, e.g. COM5 or /dev/ttyACM0")
+    parser.add_argument("port", nargs="?",
+                        help="Serial port, e.g. COM5 or /dev/ttyACM0 (default: auto-detect Teensy)")
     parser.add_argument("--no-reset", action="store_true", help="Connect without sending R")
     parser.add_argument("--debug", action="store_true", help="Print all received lines")
     args = parser.parse_args()
-    Visualiser(args.port, reset=not args.no_reset, debug=args.debug).run()
+    port = args.port or find_teensy_port()
+    print(f"Using {port}", flush=True)
+    Visualiser(port, reset=not args.no_reset, debug=args.debug).run()
 
 
 if __name__ == "__main__":

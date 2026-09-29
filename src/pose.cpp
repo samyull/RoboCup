@@ -11,8 +11,9 @@
 
 // Lens-to-floor height in metres. See pose.h - CALIBRATE FLOW_METERS_PER_COUNT
 // with a known-distance push test once this is set.
-float MOUNTING_HEIGHT = 0.08F;
-float FLOW_METERS_PER_COUNT = MOUNTING_HEIGHT * 0.0021f;   // ~0.168 mm/count at 80 mm
+// Raised 24 mm from 80 mm to ~104 mm (estimate - measure lens to floor to confirm).
+float MOUNTING_HEIGHT = 0.104F;
+float FLOW_METERS_PER_COUNT = MOUNTING_HEIGHT * 0.0021f;   // ~0.218 mm/count at 104 mm
 
 // Map the sensor's raw dx/dy onto the robot body frame (x = forward, y = left).
 // Push the robot forward, then to the left, and watch raw_dx / raw_dy in the
