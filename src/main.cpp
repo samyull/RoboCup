@@ -25,8 +25,11 @@ static bool testing = true;
 static const bool USE_WALL_ANCHOR = true;
 
 // --- Round: wait for the start button, run for 120 s, then halt ---
-// Button to ground on A7 (zener for protection): internal pull-up, pressed = LOW.
+// Button on A7 (zener for protection), internal pull-up. The wiring's polarity
+// is not assumed: whatever level the pin idles at while waiting is "released"
+// and the opposite level is "pressed" (measured on the robot: idles LOW).
 static const uint8_t  START_BUTTON_PIN   = A7;
+static const uint32_t START_LEARN_MS     = 300;  // sample the untouched level this long
 static const uint32_t START_ARM_MS       = 500;  // must read released this long before a press counts
 static const uint32_t START_PRESS_MS     = 150;  // minimum hold for a press
 static const uint32_t START_RELEASE_MS   = 50;   // release must be steady this long to start
@@ -248,8 +251,8 @@ static void check_serial_commands() {
 }
 
 // Start button, sampled every few ms. A start needs, in order:
-//   ARMING  - released continuously for START_ARM_MS (a pin idling low or
-//             flickering never gets past this),
+//   ARMING  - released continuously for START_ARM_MS (a flickering pin never
+//             gets past this),
 //   ARMED   - pressed continuously for START_PRESS_MS,
 //   PRESSED - released continuously for START_RELEASE_MS -> start (hands clear).
 // Any reading that breaks a stage's requirement drops back a stage.
@@ -264,24 +267,41 @@ static const char *start_stage_name(StartStage s) {
   return "?";
 }
 
+// Learn the untouched level: the majority reading over START_LEARN_MS.
+// (Don't hold the button while the robot boots.)
+static int learn_button_idle_level() {
+  uint32_t samples = 0, lows = 0;
+  const uint32_t start_ms = millis();
+  while (millis() - start_ms < START_LEARN_MS) {
+    ++samples;
+    if (digitalRead(START_BUTTON_PIN) == LOW) ++lows;
+    delay(2);
+  }
+  return 2 * lows > samples ? LOW : HIGH;
+}
+
 // Blocks until the start button is pressed and released (or 'G' in testing).
 // Sensors stay live and telemetry keeps flowing for pre-round checks, but
 // nothing is mapped and nothing moves. Returns how the round was started.
 static const char *wait_for_start() {
   Serial.println("=== WAITING FOR START BUTTON ===");
+  const int idle_level = learn_button_idle_level();
+  Serial.print("START_BUTTON idle level learned: "); Serial.print(idle_level == LOW ? "LOW" : "HIGH");
+  Serial.print(" - a press reads "); Serial.println(idle_level == LOW ? "HIGH" : "LOW");
   StartStage stage = START_ARMING;
   uint32_t stage_since_ms = millis();
   uint32_t last_sensor_ms = 0, last_status_ms = 0;
-  uint32_t samples = 0, low_samples = 0;  // per status period, to expose a noisy pin
+  uint32_t samples = 0, pressed_samples = 0;  // per status period, to expose a noisy pin
 
   while (true) {
     check_serial_commands();
     if (start_requested) return "serial G";
 
     const uint32_t now = millis();
-    const bool pressed = digitalRead(START_BUTTON_PIN) == LOW;
+    const int level = digitalRead(START_BUTTON_PIN);
+    const bool pressed = level != idle_level;
     ++samples;
-    if (pressed) ++low_samples;
+    if (pressed) ++pressed_samples;
 
     switch (stage) {
       case START_ARMING:
@@ -307,11 +327,11 @@ static const char *wait_for_start() {
     }
     if (now - last_status_ms >= 1000) {
       last_status_ms = now;
-      // Released should read low_pct=0; anything else while untouched means a noisy pin.
-      Serial.print("START_BUTTON,raw="); Serial.print(pressed ? 0 : 1);
-      Serial.print(",low_pct="); Serial.print(samples ? 100 * low_samples / samples : 0);
+      // Untouched should read pressed_pct=0; anything else means a noisy pin.
+      Serial.print("START_BUTTON,raw="); Serial.print(level == LOW ? 0 : 1);
+      Serial.print(",pressed_pct="); Serial.print(samples ? 100 * pressed_samples / samples : 0);
       Serial.print(",stage="); Serial.println(start_stage_name(stage));
-      samples = low_samples = 0;
+      samples = pressed_samples = 0;
     }
     delay(2);
   }
